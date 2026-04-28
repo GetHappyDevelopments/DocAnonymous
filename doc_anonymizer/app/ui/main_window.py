@@ -451,7 +451,8 @@ class MainWindow(QMainWindow):
         if not self.current_job:
             return
         for finding in self.current_job.findings:
-            finding.enabled = enabled
+            if self._finding_matches_current_filter(finding):
+                finding.enabled = enabled
         self._refresh_findings()
 
     def _update_category_filter(self) -> None:
@@ -468,22 +469,24 @@ class MainWindow(QMainWindow):
     def _apply_finding_filter(self) -> None:
         if not self.current_job:
             return
+        for row, finding in enumerate(self.current_job.findings):
+            self.findings_table.setRowHidden(row, not self._finding_matches_current_filter(finding))
+
+    def _finding_matches_current_filter(self, finding: Finding) -> bool:
         category = self.category_filter.currentText()
         active = self.active_filter.currentText()
         confidence = self.confidence_filter.currentText()
-        for row, finding in enumerate(self.current_job.findings):
-            show = True
-            if category != "Alle Kategorien" and finding.category != category:
-                show = False
-            if active == "Aktiv" and not finding.enabled:
-                show = False
-            if active == "Inaktiv" and finding.enabled:
-                show = False
-            if confidence == "< 0.70" and finding.confidence >= 0.70:
-                show = False
-            if confidence == "< 0.85" and finding.confidence >= 0.85:
-                show = False
-            self.findings_table.setRowHidden(row, not show)
+        if category != "Alle Kategorien" and finding.category != category:
+            return False
+        if active == "Aktiv" and not finding.enabled:
+            return False
+        if active == "Inaktiv" and finding.enabled:
+            return False
+        if confidence == "< 0.70" and finding.confidence >= 0.70:
+            return False
+        if confidence == "< 0.85" and finding.confidence >= 0.85:
+            return False
+        return True
 
     def _preview_selected_finding(self) -> None:
         if not self.current_job:
