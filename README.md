@@ -32,7 +32,7 @@ The original documents are never overwritten. Restoration `.dam` files are ZIP p
 - Finding filters by category, active state and confidence.
 - Context preview for selected findings.
 - Bulk activate/deactivate.
-- Project save/load via `.docanon.json`.
+- Project save/load via `.docanon`.
 - More Office text coverage through OpenXML package scanning.
 - Rule, gazetteer, address-block and optional classic NER detection for persons, companies and addresses.
 - TXT and Office restoration support from restore packages.

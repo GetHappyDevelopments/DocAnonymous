@@ -122,7 +122,7 @@ def test_project_state_roundtrip(tmp_path: Path) -> None:
     source.write_text("Bayer AG", encoding="utf-8")
     job = DocumentJob(source)
     DocumentScanner().scan(job)
-    project = tmp_path / "state.docanon.json"
+    project = tmp_path / "state.docanon"
 
     store = ProjectStateStore()
     store.save(project, [job])

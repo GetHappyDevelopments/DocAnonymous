@@ -297,14 +297,21 @@ class MainWindow(QMainWindow):
         self._refresh_findings()
 
     def save_project(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Projekt speichern", "", "DocAnonymous Projekt (*.docanon.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "Projekt speichern", "", "DocAnonymous Projekt (*.docanon)")
         if not path:
             return
+        if not path.lower().endswith(".docanon"):
+            path = f"{path}.docanon"
         self.project_store.save(Path(path), self.jobs)
         self._log(f"Projekt gespeichert: {path}")
 
     def load_project(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Projekt laden", "", "DocAnonymous Projekt (*.docanon.json)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Projekt laden",
+            "",
+            "DocAnonymous Projekt (*.docanon);;Legacy Projekt (*.docanon.json);;Alle Dateien (*)",
+        )
         if not path:
             return
         self.jobs = self.project_store.load(Path(path))
