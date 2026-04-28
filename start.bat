@@ -3,6 +3,11 @@ setlocal
 
 set "ROOT=%~dp0"
 set "PYTHON=%ROOT%.venv\Scripts\python.exe"
+set "SPLASH_SCRIPT=%ROOT%scripts\splash_screen.ps1"
+set "SPLASH_IMAGE=%ROOT%doc_anonymizer\app\assets\splash.png"
+set "SPLASH_SIGNAL=%TEMP%\DocAnonymousSplash_%RANDOM%%RANDOM%.done"
+
+call :start_splash
 
 if not exist "%PYTHON%" (
     python -m venv "%ROOT%.venv"
@@ -14,9 +19,22 @@ if errorlevel 1 goto error
 
 call :check_update
 
+call :stop_splash
+set "DOCANONYMIZER_EXTERNAL_SPLASH=1"
 "%PYTHON%" -m doc_anonymizer.app.main
 if errorlevel 1 goto error
 
+exit /b 0
+
+:start_splash
+if exist "%SPLASH_SCRIPT%" if exist "%SPLASH_IMAGE%" (
+    if exist "%SPLASH_SIGNAL%" del "%SPLASH_SIGNAL%" >nul 2>nul
+    start "" powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SPLASH_SCRIPT%" -ImagePath "%SPLASH_IMAGE%" -SignalFile "%SPLASH_SIGNAL%" -MinimumMilliseconds 3000
+)
+exit /b 0
+
+:stop_splash
+type nul > "%SPLASH_SIGNAL%"
 exit /b 0
 
 :check_update
@@ -67,6 +85,7 @@ popd >nul
 exit /b 0
 
 :error
+call :stop_splash
 echo.
 echo DocAnonymous konnte nicht gestartet werden.
 pause

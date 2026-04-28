@@ -1,6 +1,32 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Join-Path $root ".venv\Scripts\python.exe"
+$splashScript = Join-Path $root "scripts\splash_screen.ps1"
+$splashImage = Join-Path $root "doc_anonymizer\app\assets\splash.png"
+$splashSignal = Join-Path $env:TEMP ("DocAnonymousSplash_{0}.done" -f ([guid]::NewGuid().ToString("N")))
+
+function Start-SplashScreen {
+    if ((Test-Path $splashScript) -and (Test-Path $splashImage)) {
+        Remove-Item -LiteralPath $splashSignal -ErrorAction SilentlyContinue
+        Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "`"$splashScript`"",
+            "-ImagePath",
+            "`"$splashImage`"",
+            "-SignalFile",
+            "`"$splashSignal`"",
+            "-MinimumMilliseconds",
+            "3000"
+        ) | Out-Null
+    }
+}
+
+function Stop-SplashScreen {
+    New-Item -ItemType File -Path $splashSignal -Force | Out-Null
+}
 
 function Test-ApplicationUpdate {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -46,10 +72,17 @@ function Test-ApplicationUpdate {
     }
 }
 
-if (-not (Test-Path $python)) {
-    python -m venv (Join-Path $root ".venv")
-    & $python -m pip install -r (Join-Path $root "requirements.txt")
-}
+Start-SplashScreen
+try {
+    if (-not (Test-Path $python)) {
+        python -m venv (Join-Path $root ".venv")
+        & $python -m pip install -r (Join-Path $root "requirements.txt")
+    }
 
-Test-ApplicationUpdate
-& $python -m doc_anonymizer.app.main
+    Test-ApplicationUpdate
+    Stop-SplashScreen
+    $env:DOCANONYMIZER_EXTERNAL_SPLASH = "1"
+    & $python -m doc_anonymizer.app.main
+} finally {
+    Stop-SplashScreen
+}
