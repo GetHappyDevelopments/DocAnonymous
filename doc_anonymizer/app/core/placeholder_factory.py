@@ -5,12 +5,15 @@ from collections import defaultdict
 
 
 LEGAL_FORM_PATTERNS = [
+    ("GmbH & Co. KG", re.compile(r"\bGmbH\s*&\s*Co\.?\s*KG\b", re.IGNORECASE)),
     ("GmbH", re.compile(r"\bGmbH\b", re.IGNORECASE)),
-    ("AG", re.compile(r"\bAG\b", re.IGNORECASE)),
-    ("UG", re.compile(r"\bUG\b", re.IGNORECASE)),
+    ("AG", re.compile(r"\bAG\b|\bAktiengesellschaft\b", re.IGNORECASE)),
+    ("UG", re.compile(r"\bUG\b|\bUG\s*\(haftungsbeschr(?:ä|ae)nkt\)\b", re.IGNORECASE)),
+    ("SE", re.compile(r"\bSE\b", re.IGNORECASE)),
     ("KG", re.compile(r"\bKG\b", re.IGNORECASE)),
     ("OHG", re.compile(r"\bOHG\b", re.IGNORECASE)),
     ("GbR", re.compile(r"\bGbR\b", re.IGNORECASE)),
+    ("e.K.", re.compile(r"\be\.?\s?K\.?\b", re.IGNORECASE)),
     ("e.V.", re.compile(r"\be\.?\s?V\.?\b", re.IGNORECASE)),
 ]
 
@@ -21,7 +24,7 @@ class PlaceholderFactory:
         self._counters: defaultdict[tuple[str, str | None], int] = defaultdict(int)
 
     def replacement_for(self, original: str, category: str, sub_category: str | None) -> str:
-        normalized = self._normalize(original)
+        normalized = self.canonical_entity_text(original, category, sub_category)
         key = (category, sub_category, normalized)
         if key in self._known:
             return self._known[key]
@@ -43,15 +46,23 @@ class PlaceholderFactory:
     @staticmethod
     def canonical_entity_text(text: str, category: str, sub_category: str | None = None) -> str:
         value = re.sub(r"\s+", " ", text).strip()
-        value = value.replace("Aktiengesellschaft", "AG")
+        value = re.sub(r"\bAktiengesellschaft\b", "AG", value, flags=re.I)
         value = re.sub(r"\bGesellschaft mit beschraenkter Haftung\b", "GmbH", value, flags=re.I)
         value = re.sub(r"\bGesellschaft mit beschränkter Haftung\b", "GmbH", value, flags=re.I)
+        value = re.sub(r"\bUG\s*\(haftungsbeschraenkt\)\b", "UG", value, flags=re.I)
+        value = re.sub(r"\bUG\s*\(haftungsbeschränkt\)\b", "UG", value, flags=re.I)
+        value = re.sub(r"\be\.?\s?K\.?\b", "e.K.", value, flags=re.I)
         value = re.sub(r"\be\.?\s?V\.?\b", "e.V.", value, flags=re.I)
         if category == "company" and sub_category:
             # Keep the legal form for the sub-category bucket, but normalize name variants.
             value = re.sub(rf"\b{re.escape(sub_category)}\b\.?", sub_category, value, flags=re.I)
         if category == "person":
-            value = re.sub(r"\b(?:Herr|Frau|Dr\.|Prof\.|Professor)\s+", "", value, flags=re.I)
+            value = re.sub(
+                r"\b(?:Herr|Frau|Dr\.|Prof\.|Professor|Rechtsanwalt|Rechtsanwältin|RA|RAin)\s+",
+                "",
+                value,
+                flags=re.I,
+            )
         return value.casefold()
 
     @staticmethod

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from doc_anonymizer.app.core.anonymizer import DocumentAnonymizer
-from doc_anonymizer.app.core.models import DocumentJob
+from doc_anonymizer.app.core.models import DocumentJob, Finding
 from doc_anonymizer.app.core.restorer import DocumentRestorer
 from doc_anonymizer.app.core.scanner import DocumentScanner
 from doc_anonymizer.app.formats import get_handler
@@ -51,6 +51,67 @@ def test_company_variant_and_authority_detection(tmp_path: Path) -> None:
     }
     assert company_replacements == {"Firma AG 1"}
     assert any(finding.category == "authority" for finding in job.findings)
+
+
+def test_umlaut_person_company_and_address_detection(tmp_path: Path) -> None:
+    source = tmp_path / "umlauts.txt"
+    source.write_text(
+        "Frau Dr. Anna Müller wohnt in der Käferstraße 12, 12345 München.\n"
+        "Die Müller & Söhne GmbH arbeitet später nur als Müller & Söhne weiter.",
+        encoding="utf-8",
+    )
+    job = DocumentJob(source)
+
+    DocumentScanner().scan(job)
+    originals = {finding.original_text for finding in job.findings}
+
+    assert "Frau Dr. Anna Müller" in originals
+    assert "Käferstraße 12, 12345 München" in originals
+    assert "Müller & Söhne GmbH" in originals
+    assert "Müller & Söhne" in originals
+
+
+def test_multiline_address_block_detection(tmp_path: Path) -> None:
+    source = tmp_path / "address.txt"
+    source.write_text(
+        "Max Mustermann\nMusterweg 7\n10115 Berlin\n\nBitte zeitnah melden.",
+        encoding="utf-8",
+    )
+    job = DocumentJob(source)
+
+    DocumentScanner().scan(job)
+
+    assert any(
+        finding.category == "address"
+        and "Max Mustermann" in finding.original_text
+        and "10115 Berlin" in finding.original_text
+        for finding in job.findings
+    )
+
+
+def test_manual_findings_are_reused_as_local_learning(tmp_path: Path) -> None:
+    source = tmp_path / "learned.txt"
+    source.write_text("Codexia Projektbüro liefert. Codexia Projektbüro rechnet ab.", encoding="utf-8")
+    job = DocumentJob(source)
+    job.findings.append(
+        DocumentScanner()._merge_and_assign_placeholders(
+            [
+                Finding(
+                    original_text="Codexia Projektbüro",
+                    replacement_text="",
+                    category="company",
+                    confidence=1.0,
+                    source="manual",
+                )
+            ]
+        )[0]
+    )
+
+    DocumentScanner().scan(job)
+
+    learned = [finding for finding in job.findings if finding.original_text == "Codexia Projektbüro"]
+    assert learned
+    assert learned[0].occurrence_count == 2
 
 
 def test_project_state_roundtrip(tmp_path: Path) -> None:

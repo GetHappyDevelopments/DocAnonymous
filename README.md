@@ -10,6 +10,12 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m doc_anonymizer.app.main
 ```
 
+For the optional non-LLM NER layer, install a German spaCy model:
+
+```powershell
+.\.venv\Scripts\python.exe -m spacy download de_core_news_sm
+```
+
 ## Workflow
 
 1. Add documents.
@@ -28,4 +34,5 @@ The original documents are never overwritten. Restoration ZIP files contain sens
 - Bulk activate/deactivate.
 - Project save/load via `.docanon.json`.
 - More Office text coverage through OpenXML package scanning.
+- Rule, gazetteer, address-block and optional classic NER detection for persons, companies and addresses.
 - TXT and Office restoration support from restore packages.
