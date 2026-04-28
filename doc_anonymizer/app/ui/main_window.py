@@ -326,7 +326,12 @@ class MainWindow(QMainWindow):
             file_path, _ = QFileDialog.getOpenFileName(self, "Anonymisierte Datei auswaehlen", "", "Dokumente (*.docx *.xlsx *.pptx *.pdf *.txt)")
             anonymized = Path(file_path) if file_path else None
         if not restore_package or not restore_package.exists():
-            file_path, _ = QFileDialog.getOpenFileName(self, "Restore-Paket auswaehlen", "", "Restore Paket (*.zip)")
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Restore-Paket auswaehlen",
+                "",
+                "Restore Paket (*.dam);;Legacy Restore Paket (*.aim *.zip);;Alle Dateien (*)",
+            )
             restore_package = Path(file_path) if file_path else None
         if not anonymized or not restore_package:
             return

@@ -1,4 +1,5 @@
 from pathlib import Path
+import zipfile
 
 from doc_anonymizer.app.core.anonymizer import DocumentAnonymizer
 from doc_anonymizer.app.core.models import DocumentJob, Finding
@@ -32,6 +33,8 @@ def test_txt_scan_and_anonymize(tmp_path: Path) -> None:
     assert "Person 1" in text
     assert "E-Mail 1" in text
     assert job.restore_package_path.exists()
+    assert job.restore_package_path.suffix == ".dam"
+    assert zipfile.is_zipfile(job.restore_package_path)
 
 
 def test_company_variant_and_authority_detection(tmp_path: Path) -> None:

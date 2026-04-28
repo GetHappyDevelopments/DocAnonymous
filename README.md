@@ -25,7 +25,7 @@ For the optional non-LLM NER layer, install a German spaCy model:
 5. Create anonymized copies and restoration packages.
 6. Optionally restore an anonymized Office/TXT copy with the matching restoration package.
 
-The original documents are never overwritten. Restoration ZIP files contain sensitive original values and images.
+The original documents are never overwritten. Restoration `.dam` files are ZIP packages and contain sensitive original values and images.
 
 ## Features
 
