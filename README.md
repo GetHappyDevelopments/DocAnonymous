@@ -36,3 +36,9 @@ The original documents are never overwritten. Restoration `.dam` files are ZIP p
 - More Office text coverage through OpenXML package scanning.
 - Rule, gazetteer, address-block and optional classic NER detection for persons, companies and addresses.
 - TXT and Office restoration support from restore packages.
+- PDF anonymization uses a permissive PDFium-based renderer and writes image-based PDF output.
+
+## License
+
+DocAnonymous is licensed under the MIT License. See [LICENSE](LICENSE) and
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

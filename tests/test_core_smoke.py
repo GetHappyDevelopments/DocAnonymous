@@ -9,6 +9,34 @@ from doc_anonymizer.app.formats import get_handler
 from doc_anonymizer.app.storage.project_state import ProjectStateStore
 
 
+def _write_minimal_text_pdf(path: Path, text: str) -> None:
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream = f"BT /F1 24 Tf 72 720 Td ({escaped}) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        f"<< /Length {len(stream.encode('latin-1'))} >>\nstream\n{stream}\nendstream".encode("latin-1"),
+    ]
+    data = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(data))
+        data.extend(f"{index} 0 obj\n".encode("ascii"))
+        data.extend(obj)
+        data.extend(b"\nendobj\n")
+    xref_offset = len(data)
+    data.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    data.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        data.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    data.extend(
+        f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    )
+    path.write_bytes(bytes(data))
+
+
 def test_txt_scan_and_anonymize(tmp_path: Path) -> None:
     source = tmp_path / "sample.txt"
     source.write_text(
@@ -165,3 +193,17 @@ def test_docx_scan_anonymize_and_restore(tmp_path: Path) -> None:
     restored_text = "\n".join(chunk.text for chunk in get_handler(restored).extract_text(restored))
     assert "Bayer AG" in restored_text
     assert "Vater&Soehne GmbH" in restored_text
+
+
+def test_pdf_scan_and_anonymize_with_pdfium(tmp_path: Path) -> None:
+    source = tmp_path / "sample.pdf"
+    _write_minimal_text_pdf(source, "Herr Max Mustermann")
+    job = DocumentJob(source)
+
+    DocumentScanner().scan(job)
+    assert any(finding.original_text == "Herr Max Mustermann" for finding in job.findings)
+
+    DocumentAnonymizer().anonymize(job, tmp_path)
+
+    assert job.output_path.exists()
+    assert b"Herr Max Mustermann" not in job.output_path.read_bytes()

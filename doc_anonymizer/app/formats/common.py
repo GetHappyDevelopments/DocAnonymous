@@ -102,11 +102,12 @@ def extract_openxml_text(path: Path) -> list[tuple[str, str]]:
 
 def placeholder_png_bytes(width: int = 640, height: int = 360) -> bytes:
     try:
-        import fitz
+        from PIL import Image
 
-        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, width, height), 0)
-        pix.clear_with(0xBEBEBE)
-        return pix.tobytes("png")
+        image = Image.new("RGB", (width, height), (190, 190, 190))
+        out = BytesIO()
+        image.save(out, "PNG")
+        return out.getvalue()
     except Exception:
         # 1x1 gray PNG fallback.
         return (
