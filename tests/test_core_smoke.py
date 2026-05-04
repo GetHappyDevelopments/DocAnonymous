@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 import zipfile
 
 from doc_anonymizer.app.core.anonymizer import DocumentAnonymizer
@@ -223,6 +224,7 @@ def test_docx_anonymize_removes_header_images(tmp_path: Path) -> None:
     assert not any("/media/" in name.replace("\\", "/") for name in names)
     assert not any(b"/relationships/image" in data for data in xml_parts.values())
     assert not any(b"<a:blip" in data or b"<v:imagedata" in data for data in xml_parts.values())
+    assert not any(b"<w:drawing" in data for data in xml_parts.values())
     assert job.image_replacements
 
 
@@ -259,6 +261,140 @@ def test_docx_anonymize_can_keep_selected_image(tmp_path: Path) -> None:
     assert kept_path in names
     assert removed_path not in names
     assert [image.keep for image in job.image_replacements] == [True, False]
+
+
+def test_docx_restore_rebuilds_removed_image_parts(tmp_path: Path) -> None:
+    from docx import Document
+    from PIL import Image
+
+    source = tmp_path / "restore-image.docx"
+    logo = tmp_path / "logo.png"
+    Image.new("RGB", (32, 16), (120, 120, 120)).save(logo)
+
+    doc = Document()
+    doc.add_paragraph("Bayer AG")
+    doc.add_picture(str(logo))
+    doc.save(source)
+    job = DocumentJob(source)
+
+    DocumentScanner().scan(job)
+    DocumentAnonymizer().anonymize(job, tmp_path)
+
+    with zipfile.ZipFile(job.output_path, "r") as zf:
+        anonymized_names = zf.namelist()
+    assert not any("/media/" in name.replace("\\", "/") for name in anonymized_names)
+
+    restored = DocumentRestorer().restore(job.output_path, job.restore_package_path, tmp_path / "restored-image.docx")
+
+    restored_text = "\n".join(chunk.text for chunk in get_handler(restored).extract_text(restored))
+    with zipfile.ZipFile(restored, "r") as zf:
+        names = zf.namelist()
+        document = zf.read("word/document.xml")
+        document_rels = zf.read("word/_rels/document.xml.rels")
+
+    assert "Bayer AG" in restored_text
+    assert any("/media/" in name.replace("\\", "/") for name in names)
+    assert b"<a:blip" in document
+    assert b"relationships/image" in document_rels
+
+
+def test_docx_anonymize_replaces_split_footer_text(tmp_path: Path) -> None:
+    from docx import Document
+
+    source = tmp_path / "split-footer.docx"
+    doc = Document()
+    doc.add_paragraph("Body")
+    doc.sections[0].footer.paragraphs[0].text = "Footer"
+    doc.save(source)
+
+    footer_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:p>
+    <w:r><w:t>©</w:t></w:r>
+    <w:r><w:t xml:space="preserve"> </w:t></w:r>
+    <w:r><w:t>msg</w:t></w:r>
+    <w:r><w:t xml:space="preserve"> </w:t></w:r>
+    <w:r><w:t>s</w:t></w:r>
+    <w:r><w:t>ystems</w:t></w:r>
+  </w:p>
+</w:ftr>"""
+    rewritten = tmp_path / "split-footer.rewritten.docx"
+    with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(rewritten, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename != "word/footer1.xml":
+                zout.writestr(item, zin.read(item.filename))
+        zout.writestr("word/footer1.xml", footer_xml)
+    shutil.move(rewritten, source)
+
+    job = DocumentJob(source)
+    job.findings.append(
+        Finding(
+            original_text="msg systems",
+            replacement_text="Lieferant",
+            category="custom",
+        )
+    )
+
+    DocumentAnonymizer().anonymize(job, tmp_path)
+
+    with zipfile.ZipFile(job.output_path, "r") as zf:
+        footer = zf.read("word/footer1.xml").decode("utf-8")
+
+    assert "Lieferant" in footer
+    assert "msg" not in footer
+    assert "ystems" not in footer
+
+
+def test_openxml_gallery_detects_and_removes_svg_images(tmp_path: Path) -> None:
+    from docx import Document
+
+    from doc_anonymizer.app.formats.common import collect_openxml_images, neutralize_openxml_media
+
+    source = tmp_path / "svg-image.docx"
+    target = tmp_path / "svg-image.anonymized.docx"
+    doc = Document()
+    doc.add_paragraph("Bayer AG")
+    doc.save(source)
+
+    with zipfile.ZipFile(source, "a", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "word/header1.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+       xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <w:p><w:r><w:drawing><a:blip r:embed="rIdSvg"/></w:drawing></w:r></w:p>
+</w:hdr>""",
+        )
+        zf.writestr(
+            "word/_rels/header1.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdSvg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/logo.svg"/>
+</Relationships>""",
+        )
+        zf.writestr(
+            "word/media/logo.svg",
+            """<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40"><text x="0" y="20">Logo</text></svg>""",
+        )
+
+    images = collect_openxml_images(source)
+    assert [image.original_file_name for image in images] == ["logo.svg"]
+
+    job = DocumentJob(source)
+    job.image_replacements = images
+    target.write_bytes(source.read_bytes())
+    neutralize_openxml_media(source, target, job)
+
+    with zipfile.ZipFile(target, "r") as zf:
+        names = zf.namelist()
+        header_rels = zf.read("word/_rels/header1.xml.rels")
+        header = zf.read("word/header1.xml")
+
+    assert "word/media/logo.svg" not in names
+    assert b"relationships/image" not in header_rels
+    assert b"rIdSvg" not in header
+    assert b"<w:drawing" not in header
 
 
 def test_pdf_scan_and_anonymize_with_pdfium(tmp_path: Path) -> None:

@@ -13,7 +13,7 @@ from lxml import etree
 from doc_anonymizer.app.core.models import Finding, ImageLocation, ImageReplacement
 
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".emf", ".wmf"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".emf", ".wmf", ".svg"}
 RELATIONSHIP_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 IMAGE_RELATIONSHIP_TYPES = {
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
@@ -61,7 +61,7 @@ def replace_in_openxml_text_nodes(package_path: Path, findings: list[Finding]) -
             if normalized.endswith(".xml") and normalized.startswith(TEXT_XML_DIRS):
                 try:
                     root = etree.fromstring(data, parser)
-                    changed = False
+                    changed = replace_in_split_openxml_text(root, findings)
                     for node in root.iter():
                         if node.text:
                             new_text = replace_text(node.text, findings)
@@ -89,6 +89,53 @@ def replace_in_openxml_text_nodes(package_path: Path, findings: list[Finding]) -
                     pass
             zout.writestr(item, data)
     tmp_target.unlink(missing_ok=True)
+
+
+def replace_in_split_openxml_text(root: etree._Element, findings: list[Finding]) -> bool:
+    changed = False
+    for block in root.iter():
+        if _local_name(block.tag) != "p":
+            continue
+        text_nodes = [
+            node
+            for node in block.iter()
+            if _local_name(node.tag) == "t" and node.text is not None
+        ]
+        if len(text_nodes) < 2:
+            continue
+        changed = _replace_across_text_nodes(text_nodes, findings) or changed
+    return changed
+
+
+def _replace_across_text_nodes(text_nodes: list[etree._Element], findings: list[Finding]) -> bool:
+    changed = False
+    for finding in findings:
+        if not finding.original_text:
+            continue
+        while True:
+            spans: list[tuple[etree._Element, int, int]] = []
+            offset = 0
+            for node in text_nodes:
+                text = node.text or ""
+                spans.append((node, offset, offset + len(text)))
+                offset += len(text)
+            joined = "".join(node.text or "" for node in text_nodes)
+            start = joined.find(finding.original_text)
+            if start < 0:
+                break
+            end = start + len(finding.original_text)
+            touched = [(node, node_start, node_end) for node, node_start, node_end in spans if node_start < end and node_end > start]
+            if not touched:
+                break
+            first, first_start, _ = touched[0]
+            last, _, last_end = touched[-1]
+            before = (first.text or "")[: max(0, start - first_start)]
+            after = (last.text or "")[max(0, end - (last_end - len(last.text or ""))) :]
+            first.text = before + finding.replacement_text + after
+            for node, _, _ in touched[1:]:
+                node.text = ""
+            changed = True
+    return changed
 
 
 def extract_openxml_text(path: Path) -> list[tuple[str, str]]:
@@ -171,6 +218,8 @@ def _content_type_for_suffix(suffix: str) -> str:
         normalized = "jpeg"
     if normalized == "tif":
         normalized = "tiff"
+    if normalized == "svg":
+        return "image/svg+xml"
     return f"image/{normalized or 'unknown'}"
 
 
@@ -209,11 +258,12 @@ def _remove_element(element: etree._Element) -> None:
 
 def _image_container_for(element: etree._Element) -> etree._Element:
     current = element
+    container = element
     while current.getparent() is not None:
         if _local_name(current.tag) in IMAGE_CONTAINER_LOCAL_NAMES:
-            return current
+            container = current
         current = current.getparent()
-    return element
+    return container
 
 
 def _node_references_removed_image(node: etree._Element, relationship_ids: set[str]) -> bool:
@@ -323,6 +373,7 @@ def neutralize_openxml_media(source: Path, target: Path, job) -> dict[str, Path]
     embedded into the restoration ZIP.
     """
     image_files: dict[str, Path] = {}
+    openxml_part_files: dict[str, Path] = {}
     keep_by_path = {
         location.extra.get("package_path"): image.keep
         for image in getattr(job, "image_replacements", [])
@@ -331,10 +382,19 @@ def neutralize_openxml_media(source: Path, target: Path, job) -> dict[str, Path]
     }
     job.image_replacements = []
     temp_dir = Path(tempfile.mkdtemp(prefix="docanonymous-media-"))
+    part_temp_dir = Path(tempfile.mkdtemp(prefix="docanonymous-openxml-"))
     tmp_target = target.with_suffix(target.suffix + ".tmp")
     shutil.copyfile(target, tmp_target)
     removed_media_parts: set[str] = set()
     relationship_ids_by_part: dict[str, set[str]] = {}
+
+    def store_original_part(part_name: str, data: bytes) -> None:
+        if part_name in openxml_part_files:
+            return
+        part_path = part_temp_dir / f"part-{len(openxml_part_files) + 1:06d}.bin"
+        part_path.write_bytes(data)
+        openxml_part_files[part_name] = part_path
+
     with zipfile.ZipFile(tmp_target, "r") as zin, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             normalized = item.filename.replace("\\", "/")
@@ -378,7 +438,10 @@ def neutralize_openxml_media(source: Path, target: Path, job) -> dict[str, Path]
                     continue
             if normalized.endswith(".rels"):
                 try:
-                    data, _, removed_ids = _strip_image_relationships(data, normalized, removed_media_parts)
+                    new_data, changed, removed_ids = _strip_image_relationships(data, normalized, removed_media_parts)
+                    if changed:
+                        store_original_part(item.filename, data)
+                        data = new_data
                     source_part = _source_part_for_relationship_part(normalized)
                     if source_part and removed_ids:
                         relationship_ids_by_part.setdefault(source_part, set()).update(removed_ids)
@@ -386,9 +449,13 @@ def neutralize_openxml_media(source: Path, target: Path, job) -> dict[str, Path]
                     pass
             elif normalized.endswith(".xml"):
                 try:
-                    data, _ = _strip_image_markup(data, relationship_ids_by_part.get(normalized, set()))
+                    new_data, changed = _strip_image_markup(data, relationship_ids_by_part.get(normalized, set()))
+                    if changed:
+                        store_original_part(item.filename, data)
+                        data = new_data
                 except Exception:
                     pass
             zout.writestr(item, data)
     tmp_target.unlink(missing_ok=True)
+    job.openxml_part_files = openxml_part_files
     return image_files

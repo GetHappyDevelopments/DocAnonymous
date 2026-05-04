@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor, QPixmap
+from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtGui import QAction, QColor, QPainter, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -502,9 +503,17 @@ class MainWindow(QMainWindow):
             package_path = image.locations[0].extra.get("package_path") if image.locations else ""
             if package_path:
                 data = openxml_image_bytes(job.source_path, package_path)
-                pixmap = QPixmap()
-                if data and pixmap.loadFromData(data):
-                    preview.setData(Qt.ItemDataRole.DecorationRole, pixmap.scaled(96, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                pixmap = self._preview_pixmap(data, package_path) if data else QPixmap()
+                if not pixmap.isNull():
+                    preview.setData(
+                        Qt.ItemDataRole.DecorationRole,
+                        pixmap.scaled(
+                            96,
+                            64,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        ),
+                    )
             preview.setFlags(preview.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.images_table.setItem(row, 1, preview)
 
@@ -667,6 +676,21 @@ class MainWindow(QMainWindow):
         if width and height:
             return f"{int(width)} x {int(height)} px"
         return "-"
+
+    @staticmethod
+    def _preview_pixmap(data: bytes, package_path: str) -> QPixmap:
+        if package_path.lower().endswith(".svg"):
+            renderer = QSvgRenderer(QByteArray(data))
+            if renderer.isValid():
+                pixmap = QPixmap(96, 64)
+                pixmap.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(pixmap)
+                renderer.render(painter)
+                painter.end()
+                return pixmap
+        pixmap = QPixmap()
+        pixmap.loadFromData(data)
+        return pixmap
 
 
 class ManualFindingDialog(QDialog):

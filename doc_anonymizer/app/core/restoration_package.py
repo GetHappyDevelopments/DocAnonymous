@@ -21,6 +21,7 @@ def sha256_file(path: Path) -> str:
 class RestorationPackageWriter:
     def write(self, job: DocumentJob, package_path: Path, image_files: dict[str, Path] | None = None) -> None:
         image_files = image_files or {}
+        openxml_part_files = getattr(job, "openxml_part_files", {})
         package_path.parent.mkdir(parents=True, exist_ok=True)
         restore = {
             "schemaVersion": "1.0",
@@ -38,6 +39,7 @@ class RestorationPackageWriter:
             },
             "textReplacements": [asdict(f) for f in job.findings if f.enabled],
             "imageReplacements": [asdict(img) for img in job.image_replacements if not img.keep],
+            "openxmlParts": sorted(openxml_part_files),
             "securityNotice": "This package contains sensitive original data and must not be uploaded to public LLMs.",
         }
         with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -45,3 +47,6 @@ class RestorationPackageWriter:
             for image_id, file_path in image_files.items():
                 if file_path.exists():
                     zf.write(file_path, f"images/{image_id}{file_path.suffix}")
+            for part_name, file_path in openxml_part_files.items():
+                if file_path.exists():
+                    zf.write(file_path, f"openxml/{part_name}")

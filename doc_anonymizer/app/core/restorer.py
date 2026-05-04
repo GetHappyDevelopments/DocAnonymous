@@ -50,9 +50,13 @@ class DocumentRestorer:
     ) -> None:
         from doc_anonymizer.app.formats.common import replace_in_openxml_text_nodes
 
-        replace_in_openxml_text_nodes(output_path, replacements)
         tmp_target = output_path.with_suffix(output_path.suffix + ".restoretmp")
         shutil.copyfile(output_path, tmp_target)
+        package_part_map: dict[str, bytes] = {}
+        for name in restore_zip.namelist():
+            if name.startswith("openxml/") and not name.endswith("/"):
+                package_part_map[name.removeprefix("openxml/")] = restore_zip.read(name)
+
         image_map: dict[str, bytes] = {}
         for image in restore.get("imageReplacements", []):
             image_id = image.get("id")
@@ -60,12 +64,19 @@ class DocumentRestorer:
                 if name.startswith(f"images/{image_id}."):
                     image_map[image_id] = restore_zip.read(name)
                     break
+            for location in image.get("locations", []):
+                package_path = location.get("extra", {}).get("package_path")
+                if package_path and image_id in image_map:
+                    package_part_map[package_path] = image_map[image_id]
+
+        written_parts: set[str] = set()
         with zipfile.ZipFile(tmp_target, "r") as zin, zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
-                data = zin.read(item.filename)
-                for image in restore.get("imageReplacements", []):
-                    for location in image.get("locations", []):
-                        if location.get("extra", {}).get("package_path") == item.filename:
-                            data = image_map.get(image.get("id"), data)
+                data = package_part_map.get(item.filename, zin.read(item.filename))
+                written_parts.add(item.filename)
                 zout.writestr(item, data)
+            for package_path, data in package_part_map.items():
+                if package_path not in written_parts:
+                    zout.writestr(package_path, data)
         tmp_target.unlink(missing_ok=True)
+        replace_in_openxml_text_nodes(output_path, replacements)
