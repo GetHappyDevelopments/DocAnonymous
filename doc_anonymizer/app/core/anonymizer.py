@@ -14,7 +14,6 @@ class DocumentAnonymizer:
         output_path = output_dir / f"{job.source_path.stem}.anonymized{job.source_path.suffix}"
         restore_path = output_dir / f"{job.source_path.stem}.restore.dam"
         enabled_findings = self._sort_findings(job.findings)
-        job.image_replacements = []
         image_files = handler.anonymize(job.source_path, output_path, enabled_findings, job)
         job.output_path = output_path
         job.restore_package_path = restore_path

@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import zipfile
 from io import BytesIO
+from posixpath import dirname, normpath
 from pathlib import Path
 
 from lxml import etree
@@ -13,6 +14,20 @@ from doc_anonymizer.app.core.models import Finding, ImageLocation, ImageReplacem
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".emf", ".wmf"}
+RELATIONSHIP_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+IMAGE_RELATIONSHIP_TYPES = {
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/image",
+}
+IMAGE_REFERENCE_LOCAL_NAMES = {"blip", "imagedata"}
+IMAGE_CONTAINER_LOCAL_NAMES = {
+    "AlternateContent",
+    "drawing",
+    "pict",
+    "pic",
+    "object",
+    "shape",
+}
 TEXT_XML_DIRS = (
     "word/",
     "docProps/",
@@ -141,26 +156,209 @@ def placeholder_for_image(original: bytes, suffix: str) -> tuple[bytes, int | No
         return placeholder_png_bytes(), None, None
 
 
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if tag.startswith("{") else tag
+
+
+def _is_media_part(name: str) -> bool:
+    normalized = name.replace("\\", "/")
+    return "/media/" in normalized and Path(normalized).suffix.lower() in IMAGE_SUFFIXES
+
+
+def _content_type_for_suffix(suffix: str) -> str:
+    normalized = suffix.lower().lstrip(".")
+    if normalized == "jpg":
+        normalized = "jpeg"
+    if normalized == "tif":
+        normalized = "tiff"
+    return f"image/{normalized or 'unknown'}"
+
+
+def _source_part_for_relationship_part(name: str) -> str | None:
+    normalized = name.replace("\\", "/")
+    if "/_rels/" not in normalized or not normalized.endswith(".rels"):
+        return None
+    prefix, rel_name = normalized.rsplit("/_rels/", 1)
+    return f"{prefix}/{rel_name[:-5]}"
+
+
+def _relationship_target_part(relationship_part: str, target: str) -> str:
+    normalized_target = target.replace("\\", "/")
+    if normalized_target.startswith("/"):
+        return normalized_target.lstrip("/")
+    source_part = _source_part_for_relationship_part(relationship_part)
+    base = dirname(source_part) if source_part else dirname(relationship_part)
+    return normpath(f"{base}/{normalized_target}")
+
+
+def _is_image_relationship(target: str, relationship_type: str) -> bool:
+    normalized_target = target.replace("\\", "/").lower()
+    return (
+        relationship_type in IMAGE_RELATIONSHIP_TYPES
+        or "/media/" in normalized_target
+        or normalized_target.startswith("../media/")
+        or Path(normalized_target).suffix.lower() in IMAGE_SUFFIXES
+    )
+
+
+def _remove_element(element: etree._Element) -> None:
+    parent = element.getparent()
+    if parent is not None:
+        parent.remove(element)
+
+
+def _image_container_for(element: etree._Element) -> etree._Element:
+    current = element
+    while current.getparent() is not None:
+        if _local_name(current.tag) in IMAGE_CONTAINER_LOCAL_NAMES:
+            return current
+        current = current.getparent()
+    return element
+
+
+def _node_references_removed_image(node: etree._Element, relationship_ids: set[str]) -> bool:
+    if not relationship_ids:
+        return False
+    for attr, value in node.attrib.items():
+        if _local_name(attr) in {"embed", "link", "id"} and value in relationship_ids:
+            return True
+    return False
+
+
+def _strip_image_markup(data: bytes, relationship_ids: set[str] | None = None) -> tuple[bytes, bool]:
+    parser = etree.XMLParser(recover=True, resolve_entities=False)
+    root = etree.fromstring(data, parser)
+    containers: list[etree._Element] = []
+    remove_all_images = relationship_ids is None
+    relationship_ids = relationship_ids or set()
+    for node in root.iter():
+        if _local_name(node.tag) in IMAGE_REFERENCE_LOCAL_NAMES and (
+            remove_all_images or _node_references_removed_image(node, relationship_ids)
+        ):
+            containers.append(_image_container_for(node))
+    changed = False
+    for container in containers:
+        if container.getparent() is not None:
+            _remove_element(container)
+            changed = True
+    if not changed:
+        return data, False
+    return (
+        etree.tostring(
+            root,
+            xml_declaration=data.lstrip().startswith(b"<?xml"),
+            encoding="UTF-8",
+            standalone=None,
+        ),
+        True,
+    )
+
+
+def _strip_image_relationships(data: bytes, relationship_part: str, removed_media_parts: set[str]) -> tuple[bytes, bool, set[str]]:
+    parser = etree.XMLParser(recover=True, resolve_entities=False)
+    root = etree.fromstring(data, parser)
+    changed = False
+    removed_ids: set[str] = set()
+    for relationship in list(root.findall(f"{{{RELATIONSHIP_NS}}}Relationship")):
+        target = relationship.get("Target", "")
+        relationship_type = relationship.get("Type", "")
+        target_part = _relationship_target_part(relationship_part, target)
+        if _is_image_relationship(target, relationship_type) and target_part in removed_media_parts:
+            relationship_id = relationship.get("Id")
+            if relationship_id:
+                removed_ids.add(relationship_id)
+            root.remove(relationship)
+            changed = True
+    if not changed:
+        return data, False, removed_ids
+    return (
+        etree.tostring(
+            root,
+            xml_declaration=data.lstrip().startswith(b"<?xml"),
+            encoding="UTF-8",
+            standalone=None,
+        ),
+        True,
+        removed_ids,
+    )
+
+
+def collect_openxml_images(path: Path) -> list[ImageReplacement]:
+    images: list[ImageReplacement] = []
+    with zipfile.ZipFile(path, "r") as zf:
+        for name in zf.namelist():
+            normalized = name.replace("\\", "/")
+            if not _is_media_part(normalized):
+                continue
+            data = zf.read(name)
+            suffix = Path(normalized).suffix.lower()
+            _, width, height = placeholder_for_image(data, suffix)
+            image_id = f"IMG-{len(images) + 1:06d}"
+            images.append(
+                ImageReplacement(
+                    id=image_id,
+                    original_file_name=Path(normalized).name,
+                    original_mime_type=_content_type_for_suffix(suffix),
+                    placeholder_text=image_id,
+                    width=width,
+                    height=height,
+                    locations=[ImageLocation(part=normalized, extra={"package_path": normalized})],
+                )
+            )
+    return images
+
+
+def openxml_image_bytes(path: Path, package_path: str) -> bytes | None:
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            return zf.read(package_path)
+    except Exception:
+        return None
+
+
 def neutralize_openxml_media(source: Path, target: Path, job) -> dict[str, Path]:
-    """Replace media files in an OpenXML package with gray PNG placeholders.
+    """Remove media files and image references from an OpenXML package.
 
     The original media files are exported into a temporary directory and later
     embedded into the restoration ZIP.
     """
     image_files: dict[str, Path] = {}
+    keep_by_path = {
+        location.extra.get("package_path"): image.keep
+        for image in getattr(job, "image_replacements", [])
+        for location in image.locations
+        if location.extra.get("package_path")
+    }
+    job.image_replacements = []
     temp_dir = Path(tempfile.mkdtemp(prefix="docanonymous-media-"))
     tmp_target = target.with_suffix(target.suffix + ".tmp")
     shutil.copyfile(target, tmp_target)
+    removed_media_parts: set[str] = set()
+    relationship_ids_by_part: dict[str, set[str]] = {}
     with zipfile.ZipFile(tmp_target, "r") as zin, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            normalized = item.filename.replace("\\", "/")
+            if _is_media_part(normalized) and not keep_by_path.get(normalized, False):
+                removed_media_parts.add(normalized)
+        for item in zin.infolist():
+            normalized = item.filename.replace("\\", "/")
+            if not normalized.endswith(".rels"):
+                continue
+            try:
+                _, _, removed_ids = _strip_image_relationships(zin.read(item.filename), normalized, removed_media_parts)
+            except Exception:
+                continue
+            source_part = _source_part_for_relationship_part(normalized)
+            if source_part and removed_ids:
+                relationship_ids_by_part.setdefault(source_part, set()).update(removed_ids)
         for item in zin.infolist():
             data = zin.read(item.filename)
             suffix = Path(item.filename).suffix.lower()
-            if "/media/" in item.filename.replace("\\", "/") and suffix in IMAGE_SUFFIXES:
+            normalized = item.filename.replace("\\", "/")
+            if _is_media_part(normalized):
                 image_id = f"IMG-{len(job.image_replacements) + 1:06d}"
-                original_path = temp_dir / f"{image_id}{suffix}"
-                original_path.write_bytes(data)
-                image_files[image_id] = original_path
-                placeholder, width, height = placeholder_for_image(data, suffix)
+                _, width, height = placeholder_for_image(data, suffix)
+                keep_image = keep_by_path.get(normalized, False)
                 job.image_replacements.append(
                     ImageReplacement(
                         id=image_id,
@@ -170,9 +368,27 @@ def neutralize_openxml_media(source: Path, target: Path, job) -> dict[str, Path]
                         width=width,
                         height=height,
                         locations=[ImageLocation(part=item.filename, extra={"package_path": item.filename})],
+                        keep=keep_image,
                     )
                 )
-                data = placeholder
+                if not keep_image:
+                    original_path = temp_dir / f"{image_id}{suffix}"
+                    original_path.write_bytes(data)
+                    image_files[image_id] = original_path
+                    continue
+            if normalized.endswith(".rels"):
+                try:
+                    data, _, removed_ids = _strip_image_relationships(data, normalized, removed_media_parts)
+                    source_part = _source_part_for_relationship_part(normalized)
+                    if source_part and removed_ids:
+                        relationship_ids_by_part.setdefault(source_part, set()).update(removed_ids)
+                except Exception:
+                    pass
+            elif normalized.endswith(".xml"):
+                try:
+                    data, _ = _strip_image_markup(data, relationship_ids_by_part.get(normalized, set()))
+                except Exception:
+                    pass
             zout.writestr(item, data)
     tmp_target.unlink(missing_ok=True)
     return image_files

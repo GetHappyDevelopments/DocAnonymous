@@ -195,6 +195,72 @@ def test_docx_scan_anonymize_and_restore(tmp_path: Path) -> None:
     assert "Vater&Soehne GmbH" in restored_text
 
 
+def test_docx_anonymize_removes_header_images(tmp_path: Path) -> None:
+    from docx import Document
+    from PIL import Image
+
+    source = tmp_path / "header-image.docx"
+    logo = tmp_path / "logo.png"
+    Image.new("RGB", (32, 16), (120, 120, 120)).save(logo)
+
+    doc = Document()
+    doc.add_paragraph("Bayer AG")
+    doc.sections[0].header.paragraphs[0].add_run().add_picture(str(logo))
+    doc.save(source)
+    job = DocumentJob(source)
+
+    DocumentScanner().scan(job)
+    DocumentAnonymizer().anonymize(job, tmp_path)
+
+    with zipfile.ZipFile(job.output_path, "r") as zf:
+        names = zf.namelist()
+        xml_parts = {
+            name: zf.read(name)
+            for name in names
+            if name.endswith((".xml", ".rels")) and name.startswith("word/")
+        }
+
+    assert not any("/media/" in name.replace("\\", "/") for name in names)
+    assert not any(b"/relationships/image" in data for data in xml_parts.values())
+    assert not any(b"<a:blip" in data or b"<v:imagedata" in data for data in xml_parts.values())
+    assert job.image_replacements
+
+
+def test_docx_anonymize_can_keep_selected_image(tmp_path: Path) -> None:
+    from docx import Document
+    from PIL import Image
+
+    from doc_anonymizer.app.formats.common import collect_openxml_images
+
+    source = tmp_path / "selected-image.docx"
+    keep_logo = tmp_path / "keep.png"
+    remove_logo = tmp_path / "remove.png"
+    Image.new("RGB", (32, 16), (120, 120, 120)).save(keep_logo)
+    Image.new("RGB", (32, 16), (200, 200, 200)).save(remove_logo)
+
+    doc = Document()
+    doc.add_paragraph("Bayer AG")
+    doc.add_picture(str(keep_logo))
+    doc.add_picture(str(remove_logo))
+    doc.save(source)
+
+    job = DocumentJob(source)
+    DocumentScanner().scan(job)
+    job.image_replacements = collect_openxml_images(source)
+    job.image_replacements[0].keep = True
+    kept_path = job.image_replacements[0].locations[0].extra["package_path"]
+    removed_path = job.image_replacements[1].locations[0].extra["package_path"]
+
+    DocumentAnonymizer().anonymize(job, tmp_path)
+
+    with zipfile.ZipFile(job.output_path, "r") as zf:
+        names = zf.namelist()
+
+    assert kept_path in names
+    assert removed_path not in names
+    assert [image.keep for image in job.image_replacements] == [True, False]
+
+
 def test_pdf_scan_and_anonymize_with_pdfium(tmp_path: Path) -> None:
     source = tmp_path / "sample.pdf"
     _write_minimal_text_pdf(source, "Herr Max Mustermann")

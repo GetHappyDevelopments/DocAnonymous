@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor
+from PySide6.QtGui import QAction, QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -37,6 +38,7 @@ from doc_anonymizer.app.core.placeholder_factory import PlaceholderFactory
 from doc_anonymizer.app.core.restorer import DocumentRestorer
 from doc_anonymizer.app.core.scanner import DocumentScanner
 from doc_anonymizer.app.formats import get_handler
+from doc_anonymizer.app.formats.common import collect_openxml_images, openxml_image_bytes
 from doc_anonymizer.app.storage.project_state import ProjectStateStore
 
 
@@ -133,6 +135,8 @@ class MainWindow(QMainWindow):
         upper.addWidget(side)
         upper.setSizes([900, 360])
 
+        review_tabs = QTabWidget()
+
         findings_panel = QWidget()
         findings_layout = QVBoxLayout(findings_panel)
         findings_layout.setContentsMargins(0, 0, 0, 0)
@@ -164,7 +168,30 @@ class MainWindow(QMainWindow):
         self.findings_table.itemChanged.connect(self._finding_item_changed)
         self.findings_table.itemSelectionChanged.connect(self._preview_selected_finding)
         findings_layout.addWidget(self.findings_table)
-        splitter.addWidget(self._wrap("Findings pruefen und bearbeiten", findings_panel))
+        review_tabs.addTab(findings_panel, "Findings")
+
+        images_panel = QWidget()
+        images_layout = QVBoxLayout(images_panel)
+        images_layout.setContentsMargins(0, 0, 0, 0)
+        image_actions = QHBoxLayout()
+        keep_all_images = QPushButton("Alle behalten")
+        keep_all_images.clicked.connect(lambda: self._set_all_images_keep(True))
+        remove_all_images = QPushButton("Alle entfernen")
+        remove_all_images.clicked.connect(lambda: self._set_all_images_keep(False))
+        image_actions.addWidget(keep_all_images)
+        image_actions.addWidget(remove_all_images)
+        image_actions.addStretch(1)
+        images_layout.addLayout(image_actions)
+
+        self.images_table = QTableWidget(0, 6)
+        self.images_table.setHorizontalHeaderLabels(["Behalten", "Vorschau", "Datei", "Typ", "Groesse", "Ort"])
+        self.images_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.images_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.images_table.itemChanged.connect(self._image_item_changed)
+        images_layout.addWidget(self.images_table)
+        review_tabs.addTab(images_panel, "Bilder")
+
+        splitter.addWidget(self._wrap("Pruefen und bearbeiten", review_tabs))
         splitter.setSizes([330, 450])
 
         self.setCentralWidget(root)
@@ -267,6 +294,7 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self._refresh_documents()
         self._refresh_findings()
+        self._refresh_images()
 
     def anonymize_selected(self) -> None:
         jobs = self._selected_jobs()
@@ -295,6 +323,7 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self._refresh_documents()
         self._refresh_findings()
+        self._refresh_images()
 
     def save_project(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Projekt speichern", "", "DocAnonymous Projekt (*.docanon)")
@@ -320,6 +349,7 @@ class MainWindow(QMainWindow):
         if self.jobs:
             self.document_table.selectRow(0)
         self._refresh_findings()
+        self._refresh_images()
         self._log(f"Projekt geladen: {path}")
 
     def restore_document(self) -> None:
@@ -385,6 +415,7 @@ class MainWindow(QMainWindow):
         rows = self.document_table.selectionModel().selectedRows()
         self.current_job = self.jobs[rows[0].row()] if rows else None
         self._refresh_findings()
+        self._refresh_images()
 
     def _selected_jobs(self) -> list[DocumentJob]:
         rows = self.document_table.selectionModel().selectedRows()
@@ -440,6 +471,70 @@ class MainWindow(QMainWindow):
         self._apply_finding_filter()
         self._refresh_summary()
         self._preview_selected_finding()
+
+    def _ensure_image_choices(self, job: DocumentJob) -> None:
+        if job.image_replacements or job.source_path.suffix.lower() not in {".docx", ".xlsx", ".pptx"}:
+            return
+        try:
+            job.image_replacements = collect_openxml_images(job.source_path)
+        except Exception as exc:
+            job.errors.append(f"Bild-Galerie nicht verfuegbar: {exc}")
+
+    def _refresh_images(self) -> None:
+        self.images_table.blockSignals(True)
+        job = self.current_job
+        if not job:
+            self.images_table.setRowCount(0)
+            self.images_table.blockSignals(False)
+            self._refresh_summary()
+            return
+        self._ensure_image_choices(job)
+        images = job.image_replacements
+        self.images_table.setRowCount(len(images))
+        self.images_table.setIconSize(QPixmap(96, 64).size())
+        for row, image in enumerate(images):
+            keep = QTableWidgetItem()
+            keep.setFlags(keep.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            keep.setCheckState(Qt.CheckState.Checked if image.keep else Qt.CheckState.Unchecked)
+            self.images_table.setItem(row, 0, keep)
+
+            preview = QTableWidgetItem()
+            package_path = image.locations[0].extra.get("package_path") if image.locations else ""
+            if package_path:
+                data = openxml_image_bytes(job.source_path, package_path)
+                pixmap = QPixmap()
+                if data and pixmap.loadFromData(data):
+                    preview.setData(Qt.ItemDataRole.DecorationRole, pixmap.scaled(96, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            preview.setFlags(preview.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.images_table.setItem(row, 1, preview)
+
+            values = [
+                image.original_file_name,
+                image.original_mime_type,
+                self._image_size_label(image.width, image.height),
+                package_path or "-",
+            ]
+            for col, value in enumerate(values, start=2):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.images_table.setItem(row, col, item)
+            self.images_table.setRowHeight(row, 72)
+        self.images_table.blockSignals(False)
+        self._refresh_summary()
+
+    def _image_item_changed(self, item: QTableWidgetItem) -> None:
+        if not self.current_job or item.column() != 0 or item.row() >= len(self.current_job.image_replacements):
+            return
+        self.current_job.image_replacements[item.row()].keep = item.checkState() == Qt.CheckState.Checked
+        self._refresh_summary()
+
+    def _set_all_images_keep(self, keep: bool) -> None:
+        if not self.current_job:
+            return
+        self._ensure_image_choices(self.current_job)
+        for image in self.current_job.image_replacements:
+            image.keep = keep
+        self._refresh_images()
 
     def _finding_item_changed(self, item: QTableWidgetItem) -> None:
         if not self.current_job or item.row() >= len(self.current_job.findings):
@@ -536,11 +631,14 @@ class MainWindow(QMainWindow):
             self.summary.setText("Keine Datei ausgewaehlt")
             return
         active = len([f for f in job.findings if f.enabled])
+        self._ensure_image_choices(job)
+        removed_images = len([img for img in job.image_replacements if not img.keep])
+        kept_images = len(job.image_replacements) - removed_images
         self.summary.setText(
             f"{job.source_path.name}\n"
             f"Status: {job.status}\n"
             f"Findings: {len(job.findings)} gesamt, {active} aktiv\n"
-            f"Bilder: {len(job.image_replacements)} ersetzt\n"
+            f"Bilder: {removed_images} entfernen, {kept_images} behalten\n"
             f"Ausgabe: {job.output_path or '-'}\n"
             f"Restore: {job.restore_package_path or '-'}"
         )
@@ -563,6 +661,12 @@ class MainWindow(QMainWindow):
         if size < 1024 * 1024:
             return f"{size / 1024:.1f} KB"
         return f"{size / (1024 * 1024):.1f} MB"
+
+    @staticmethod
+    def _image_size_label(width: float | None, height: float | None) -> str:
+        if width and height:
+            return f"{int(width)} x {int(height)} px"
+        return "-"
 
 
 class ManualFindingDialog(QDialog):

@@ -37,7 +37,7 @@ class RestorationPackageWriter:
                 "sha256": sha256_file(job.output_path) if job.output_path and job.output_path.exists() else None,
             },
             "textReplacements": [asdict(f) for f in job.findings if f.enabled],
-            "imageReplacements": [asdict(img) for img in job.image_replacements],
+            "imageReplacements": [asdict(img) for img in job.image_replacements if not img.keep],
             "securityNotice": "This package contains sensitive original data and must not be uploaded to public LLMs.",
         }
         with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:

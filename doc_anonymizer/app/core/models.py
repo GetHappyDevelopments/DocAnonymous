@@ -72,6 +72,7 @@ class ImageReplacement:
     width: float | None = None
     height: float | None = None
     locations: list[ImageLocation] = field(default_factory=list)
+    keep: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ImageReplacement":
