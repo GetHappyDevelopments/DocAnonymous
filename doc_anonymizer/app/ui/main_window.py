@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt
-from PySide6.QtGui import QAction, QColor, QPainter, QPixmap
-from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QColor, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -68,6 +67,63 @@ CATEGORY_OPTIONS = (
     "reference",
 )
 
+PREVIEW_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}
+MAX_PREVIEW_BYTES = 8 * 1024 * 1024
+MAX_PREVIEW_PIXELS = 16_000_000
+
+
+class ProcessingWorker(QObject):
+    log_message = Signal(str)
+    refresh_documents = Signal()
+    finished = Signal()
+
+    def __init__(self, action: str, jobs: list[DocumentJob], i18n: Translator) -> None:
+        super().__init__()
+        self.action = action
+        self.jobs = jobs
+        self.i18n = i18n
+        self.scanner = DocumentScanner()
+        self.anonymizer = DocumentAnonymizer()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            if self.action == "scan":
+                self._scan_jobs()
+            elif self.action == "anonymize":
+                self._anonymize_jobs()
+        finally:
+            self.finished.emit()
+
+    def _scan_jobs(self) -> None:
+        for job in self.jobs:
+            job.status = "Scan laeuft"
+            self.refresh_documents.emit()
+            try:
+                self.scanner.scan(job)
+                self.log_message.emit(
+                    self._t("log.scan_complete", file_name=job.source_path.name, count=len(job.findings))
+                )
+            except Exception as exc:
+                job.status = "Fehler"
+                job.errors.append(str(exc))
+                self.log_message.emit(self._t("log.scan_error", file_name=job.source_path.name, error=exc))
+
+    def _anonymize_jobs(self) -> None:
+        for job in self.jobs:
+            try:
+                self.anonymizer.anonymize(job)
+                self.log_message.emit(
+                    self._t("log.anonymized", output_path=job.output_path, restore_path=job.restore_package_path)
+                )
+            except Exception as exc:
+                job.status = "Fehler"
+                job.errors.append(str(exc))
+                self.log_message.emit(self._t("log.anonymize_error", file_name=job.source_path.name, error=exc))
+
+    def _t(self, key: str, **values) -> str:
+        return self.i18n.text(key, **values)
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -80,6 +136,8 @@ class MainWindow(QMainWindow):
         self.restorer = DocumentRestorer()
         self.project_store = ProjectStateStore()
         self.i18n = Translator()
+        self._worker_thread: QThread | None = None
+        self._worker: ProcessingWorker | None = None
         self._build_ui()
         self._apply_style()
 
@@ -87,46 +145,46 @@ class MainWindow(QMainWindow):
         return self.i18n.text(key, **values)
 
     def _build_ui(self) -> None:
-        toolbar = QToolBar(self._t("toolbar.actions"))
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+        self.toolbar = QToolBar(self._t("toolbar.actions"))
+        self.toolbar.setMovable(False)
+        self.addToolBar(self.toolbar)
 
         add_action = QAction(self._t("action.add_files"), self)
         add_action.triggered.connect(self.add_files)
-        toolbar.addAction(add_action)
+        self.toolbar.addAction(add_action)
 
         folder_action = QAction(self._t("action.add_folder"), self)
         folder_action.triggered.connect(self.add_folder)
-        toolbar.addAction(folder_action)
+        self.toolbar.addAction(folder_action)
 
         scan_action = QAction(self._t("action.scan"), self)
         scan_action.triggered.connect(self.scan_selected)
-        toolbar.addAction(scan_action)
+        self.toolbar.addAction(scan_action)
 
         anonymize_action = QAction(self._t("action.anonymize"), self)
         anonymize_action.triggered.connect(self.anonymize_selected)
-        toolbar.addAction(anonymize_action)
+        self.toolbar.addAction(anonymize_action)
 
         manual_action = QAction(self._t("action.manual_finding"), self)
         manual_action.triggered.connect(self.add_manual_finding)
-        toolbar.addAction(manual_action)
+        self.toolbar.addAction(manual_action)
 
         save_action = QAction(self._t("action.save_project"), self)
         save_action.triggered.connect(self.save_project)
-        toolbar.addAction(save_action)
+        self.toolbar.addAction(save_action)
 
         load_action = QAction(self._t("action.load_project"), self)
         load_action.triggered.connect(self.load_project)
-        toolbar.addAction(load_action)
+        self.toolbar.addAction(load_action)
 
         restore_action = QAction(self._t("action.restore"), self)
         restore_action.triggered.connect(self.restore_document)
-        toolbar.addAction(restore_action)
+        self.toolbar.addAction(restore_action)
 
         self.llm_toggle = QCheckBox(self._t("label.local_llm"))
         self.llm_toggle.setToolTip(self._t("tooltip.local_llm"))
         self.llm_toggle.setEnabled(False)
-        toolbar.addWidget(self.llm_toggle)
+        self.toolbar.addWidget(self.llm_toggle)
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
@@ -339,23 +397,7 @@ class MainWindow(QMainWindow):
         if not jobs:
             self._warn(self._t("message.select_one_document"))
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            for job in jobs:
-                job.status = "Scan laeuft"
-                self._refresh_documents()
-                try:
-                    self.scanner.scan(job)
-                    self._log(self._t("log.scan_complete", file_name=job.source_path.name, count=len(job.findings)))
-                except Exception as exc:
-                    job.status = "Fehler"
-                    job.errors.append(str(exc))
-                    self._log(self._t("log.scan_error", file_name=job.source_path.name, error=exc))
-        finally:
-            QApplication.restoreOverrideCursor()
-        self._refresh_documents()
-        self._refresh_findings()
-        self._refresh_images()
+        self._start_processing("scan", jobs)
 
     def anonymize_selected(self) -> None:
         jobs = self._selected_jobs()
@@ -369,27 +411,7 @@ class MainWindow(QMainWindow):
             )
             if not answer:
                 return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            for job in jobs:
-                try:
-                    self.anonymizer.anonymize(job)
-                    self._log(
-                        self._t(
-                            "log.anonymized",
-                            output_path=job.output_path,
-                            restore_path=job.restore_package_path,
-                        )
-                    )
-                except Exception as exc:
-                    job.status = "Fehler"
-                    job.errors.append(str(exc))
-                    self._log(self._t("log.anonymize_error", file_name=job.source_path.name, error=exc))
-        finally:
-            QApplication.restoreOverrideCursor()
-        self._refresh_documents()
-        self._refresh_findings()
-        self._refresh_images()
+        self._start_processing("anonymize", jobs)
 
     def save_project(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -576,9 +598,9 @@ class MainWindow(QMainWindow):
 
             preview = QTableWidgetItem()
             package_path = image.locations[0].extra.get("package_path") if image.locations else ""
-            if package_path:
+            if package_path and self._can_load_preview(package_path, image.width, image.height):
                 data = openxml_image_bytes(job.source_path, package_path)
-                pixmap = self._preview_pixmap(data, package_path) if data else QPixmap()
+                pixmap = self._preview_pixmap(data) if data and len(data) <= MAX_PREVIEW_BYTES else QPixmap()
                 if not pixmap.isNull():
                     preview.setData(
                         Qt.ItemDataRole.DecorationRole,
@@ -732,6 +754,36 @@ class MainWindow(QMainWindow):
         self.log.append(text)
         self.statusBar().showMessage(text, 7000)
 
+    def _start_processing(self, action: str, jobs: list[DocumentJob]) -> None:
+        if self._worker_thread and self._worker_thread.isRunning():
+            return
+        self.toolbar.setEnabled(False)
+        if self.centralWidget():
+            self.centralWidget().setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._worker_thread = QThread(self)
+        self._worker = ProcessingWorker(action, jobs, self.i18n)
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.log_message.connect(self._log)
+        self._worker.refresh_documents.connect(self._refresh_documents)
+        self._worker.finished.connect(self._processing_finished)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.start()
+
+    def _processing_finished(self) -> None:
+        QApplication.restoreOverrideCursor()
+        if self.centralWidget():
+            self.centralWidget().setEnabled(True)
+        self.toolbar.setEnabled(True)
+        self._refresh_documents()
+        self._refresh_findings()
+        self._refresh_images()
+        self._worker = None
+        self._worker_thread = None
+
     def _warn(self, text: str) -> None:
         message = QMessageBox(self)
         message.setIcon(QMessageBox.Icon.Warning)
@@ -783,16 +835,15 @@ class MainWindow(QMainWindow):
         return "-"
 
     @staticmethod
-    def _preview_pixmap(data: bytes, package_path: str) -> QPixmap:
-        if package_path.lower().endswith(".svg"):
-            renderer = QSvgRenderer(QByteArray(data))
-            if renderer.isValid():
-                pixmap = QPixmap(96, 64)
-                pixmap.fill(Qt.GlobalColor.transparent)
-                painter = QPainter(pixmap)
-                renderer.render(painter)
-                painter.end()
-                return pixmap
+    def _can_load_preview(package_path: str, width: float | None, height: float | None) -> bool:
+        if Path(package_path).suffix.lower() not in PREVIEW_IMAGE_SUFFIXES:
+            return False
+        if width and height and width * height > MAX_PREVIEW_PIXELS:
+            return False
+        return True
+
+    @staticmethod
+    def _preview_pixmap(data: bytes) -> QPixmap:
         pixmap = QPixmap()
         pixmap.loadFromData(data)
         return pixmap

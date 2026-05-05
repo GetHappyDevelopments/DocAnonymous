@@ -356,14 +356,34 @@ def test_openxml_gallery_detects_and_removes_svg_images(tmp_path: Path) -> None:
     doc.add_paragraph("Bayer AG")
     doc.save(source)
 
+    with zipfile.ZipFile(source, "r") as zf:
+        content_types = zf.read("[Content_Types].xml").decode("utf-8")
+        content_types = content_types.replace(
+            "</Types>",
+            '<Override PartName="/word/media/logo.svg" ContentType="image/svg+xml"/>'
+            '<Override PartName="/word/media/photo.wdp" ContentType="image/vnd.ms-photo"/>'
+            "</Types>",
+        )
+    rewritten = tmp_path / "svg-image.rewritten.docx"
+    with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(rewritten, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename != "[Content_Types].xml":
+                zout.writestr(item, zin.read(item.filename))
+        zout.writestr("[Content_Types].xml", content_types)
+    shutil.move(rewritten, source)
+
     with zipfile.ZipFile(source, "a", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(
             "word/header1.xml",
             """<?xml version="1.0" encoding="UTF-8"?>
 <w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
        xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-  <w:p><w:r><w:drawing><a:blip r:embed="rIdSvg"/></w:drawing></w:r></w:p>
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main">
+  <w:p>
+    <w:r><w:drawing><a:blip r:embed="rIdSvg"><a:extLst><a:ext><asvg:svgBlip r:embed="rIdSvg"/></a:ext></a:extLst></a:blip></w:drawing></w:r>
+    <w:r><w:drawing><a:blip r:embed="rIdWdp"/></w:drawing></w:r>
+  </w:p>
 </w:hdr>""",
         )
         zf.writestr(
@@ -371,15 +391,17 @@ def test_openxml_gallery_detects_and_removes_svg_images(tmp_path: Path) -> None:
             """<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rIdSvg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/logo.svg"/>
+  <Relationship Id="rIdWdp" Type="http://schemas.microsoft.com/office/2007/relationships/hdphoto" Target="media/photo.wdp"/>
 </Relationships>""",
         )
         zf.writestr(
             "word/media/logo.svg",
             """<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40"><text x="0" y="20">Logo</text></svg>""",
         )
+        zf.writestr("word/media/photo.wdp", b"fake-wdp")
 
     images = collect_openxml_images(source)
-    assert [image.original_file_name for image in images] == ["logo.svg"]
+    assert {image.original_file_name for image in images} == {"logo.svg", "photo.wdp"}
 
     job = DocumentJob(source)
     job.image_replacements = images
@@ -390,11 +412,54 @@ def test_openxml_gallery_detects_and_removes_svg_images(tmp_path: Path) -> None:
         names = zf.namelist()
         header_rels = zf.read("word/_rels/header1.xml.rels")
         header = zf.read("word/header1.xml")
+        content_types = zf.read("[Content_Types].xml")
 
     assert "word/media/logo.svg" not in names
+    assert "word/media/photo.wdp" not in names
+    assert b"logo.svg" not in content_types
+    assert b"photo.wdp" not in content_types
     assert b"relationships/image" not in header_rels
+    assert b"relationships/hdphoto" not in header_rels
     assert b"rIdSvg" not in header
+    assert b"rIdWdp" not in header
     assert b"<w:drawing" not in header
+
+
+def test_pptx_anonymize_preserves_run_formatting(tmp_path: Path) -> None:
+    from pptx import Presentation
+
+    source = tmp_path / "formatted.pptx"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    textbox = slide.shapes.add_textbox(0, 0, 4000000, 1000000)
+    paragraph = textbox.text_frame.paragraphs[0]
+    bold_run = paragraph.add_run()
+    bold_run.text = "Bayer AG"
+    bold_run.font.bold = True
+    italic_run = paragraph.add_run()
+    italic_run.text = " bleibt sichtbar"
+    italic_run.font.italic = True
+    prs.save(source)
+
+    job = DocumentJob(source)
+    job.findings.append(
+        Finding(
+            original_text="Bayer AG",
+            replacement_text="Firma AG 1",
+            category="company",
+        )
+    )
+
+    DocumentAnonymizer().anonymize(job, tmp_path)
+
+    with zipfile.ZipFile(job.output_path, "r") as zf:
+        slide_xml = zf.read("ppt/slides/slide1.xml").decode("utf-8")
+
+    assert "Firma AG 1" in slide_xml
+    assert "Bayer AG" not in slide_xml
+    assert 'b="1"' in slide_xml
+    assert 'i="1"' in slide_xml
+    assert " bleibt sichtbar" in slide_xml
 
 
 def test_pdf_scan_and_anonymize_with_pdfium(tmp_path: Path) -> None:

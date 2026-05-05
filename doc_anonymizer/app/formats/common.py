@@ -3,23 +3,27 @@ from __future__ import annotations
 import re
 import shutil
 import tempfile
+import warnings
 import zipfile
 from io import BytesIO
 from posixpath import dirname, normpath
 from pathlib import Path
 
 from lxml import etree
+from PIL import Image
 
 from doc_anonymizer.app.core.models import Finding, ImageLocation, ImageReplacement
 
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".emf", ".wmf", ".svg"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".emf", ".wmf", ".svg", ".wdp"}
 RELATIONSHIP_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 IMAGE_RELATIONSHIP_TYPES = {
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
     "http://purl.oclc.org/ooxml/officeDocument/relationships/image",
+    "http://schemas.microsoft.com/office/2007/relationships/hdphoto",
 }
-IMAGE_REFERENCE_LOCAL_NAMES = {"blip", "imagedata"}
+IMAGE_REFERENCE_LOCAL_NAMES = {"blip", "svgBlip", "imagedata"}
 IMAGE_CONTAINER_LOCAL_NAMES = {
     "AlternateContent",
     "drawing",
@@ -220,7 +224,40 @@ def _content_type_for_suffix(suffix: str) -> str:
         normalized = "tiff"
     if normalized == "svg":
         return "image/svg+xml"
+    if normalized == "wdp":
+        return "image/vnd.ms-photo"
     return f"image/{normalized or 'unknown'}"
+
+
+def _image_dimensions(original: bytes, suffix: str) -> tuple[int | None, int | None]:
+    if suffix.lower() == ".svg":
+        try:
+            root = etree.fromstring(original, etree.XMLParser(resolve_entities=False))
+            width = _svg_length_to_int(root.get("width"))
+            height = _svg_length_to_int(root.get("height"))
+            if width and height:
+                return width, height
+            view_box = root.get("viewBox")
+            if view_box:
+                parts = [float(part) for part in re.split(r"[\s,]+", view_box.strip()) if part]
+                if len(parts) == 4:
+                    return int(parts[2]), int(parts[3])
+        except Exception:
+            return None, None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(original)) as img:
+                return img.size
+    except Exception:
+        return None, None
+
+
+def _svg_length_to_int(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)", value)
+    return int(float(match.group(1))) if match else None
 
 
 def _source_part_for_relationship_part(name: str) -> str | None:
@@ -333,6 +370,27 @@ def _strip_image_relationships(data: bytes, relationship_part: str, removed_medi
     )
 
 
+def _strip_content_type_overrides(data: bytes, removed_parts: set[str]) -> tuple[bytes, bool]:
+    root = etree.fromstring(data, etree.XMLParser(resolve_entities=False))
+    changed = False
+    for override in list(root.findall(f"{{{CONTENT_TYPES_NS}}}Override")):
+        part_name = (override.get("PartName") or "").lstrip("/")
+        if part_name in removed_parts:
+            root.remove(override)
+            changed = True
+    if not changed:
+        return data, False
+    return (
+        etree.tostring(
+            root,
+            xml_declaration=data.lstrip().startswith(b"<?xml"),
+            encoding="UTF-8",
+            standalone=None,
+        ),
+        True,
+    )
+
+
 def collect_openxml_images(path: Path) -> list[ImageReplacement]:
     images: list[ImageReplacement] = []
     with zipfile.ZipFile(path, "r") as zf:
@@ -342,7 +400,7 @@ def collect_openxml_images(path: Path) -> list[ImageReplacement]:
                 continue
             data = zf.read(name)
             suffix = Path(normalized).suffix.lower()
-            _, width, height = placeholder_for_image(data, suffix)
+            width, height = _image_dimensions(data, suffix)
             image_id = f"IMG-{len(images) + 1:06d}"
             images.append(
                 ImageReplacement(
@@ -415,15 +473,23 @@ def neutralize_openxml_media(source: Path, target: Path, job) -> dict[str, Path]
             data = zin.read(item.filename)
             suffix = Path(item.filename).suffix.lower()
             normalized = item.filename.replace("\\", "/")
+            if normalized == "[Content_Types].xml":
+                try:
+                    new_data, changed = _strip_content_type_overrides(data, removed_media_parts)
+                    if changed:
+                        store_original_part(item.filename, data)
+                        data = new_data
+                except Exception:
+                    pass
             if _is_media_part(normalized):
                 image_id = f"IMG-{len(job.image_replacements) + 1:06d}"
-                _, width, height = placeholder_for_image(data, suffix)
+                width, height = _image_dimensions(data, suffix)
                 keep_image = keep_by_path.get(normalized, False)
                 job.image_replacements.append(
                     ImageReplacement(
                         id=image_id,
                         original_file_name=Path(item.filename).name,
-                        original_mime_type=f"image/{suffix.lstrip('.')}",
+                        original_mime_type=_content_type_for_suffix(suffix),
                         placeholder_text=image_id,
                         width=width,
                         height=height,
