@@ -255,15 +255,35 @@ class MainWindow(QMainWindow):
         enable_all.clicked.connect(lambda: self._set_all_findings(True))
         disable_all = QPushButton(self._t("bulk.disable_all"))
         disable_all.clicked.connect(lambda: self._set_all_findings(False))
-        for widget in (self.category_filter, self.active_filter, self.confidence_filter, enable_all, disable_all):
+        correct_all = QPushButton(self._t("bulk.correct_all"))
+        correct_all.clicked.connect(lambda: self._set_all_review_state("correct", True))
+        correct_none = QPushButton(self._t("bulk.correct_none"))
+        correct_none.clicked.connect(lambda: self._set_all_review_state("correct", False))
+        incorrect_all = QPushButton(self._t("bulk.incorrect_all"))
+        incorrect_all.clicked.connect(lambda: self._set_all_review_state("incorrect", True))
+        incorrect_none = QPushButton(self._t("bulk.incorrect_none"))
+        incorrect_none.clicked.connect(lambda: self._set_all_review_state("incorrect", False))
+        for widget in (
+            self.category_filter,
+            self.active_filter,
+            self.confidence_filter,
+            enable_all,
+            disable_all,
+            correct_all,
+            correct_none,
+            incorrect_all,
+            incorrect_none,
+        ):
             filters.addWidget(widget)
         filters.addStretch(1)
         findings_layout.addLayout(filters)
 
-        self.findings_table = QTableWidget(0, 8)
+        self.findings_table = QTableWidget(0, 10)
         self.findings_table.setHorizontalHeaderLabels(
             [
                 self._t("table.findings.active"),
+                self._t("table.findings.correct"),
+                self._t("table.findings.incorrect"),
                 self._t("table.findings.original"),
                 self._t("table.findings.replacement"),
                 self._t("table.findings.category"),
@@ -273,8 +293,8 @@ class MainWindow(QMainWindow):
                 self._t("table.findings.occurrences"),
             ]
         )
-        self.findings_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.findings_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.findings_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.findings_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.findings_table.itemChanged.connect(self._finding_item_changed)
         self.findings_table.itemSelectionChanged.connect(self._preview_selected_finding)
         findings_layout.addWidget(self.findings_table)
@@ -542,6 +562,9 @@ class MainWindow(QMainWindow):
         self.findings_table.blockSignals(True)
         job = self.current_job
         findings = job.findings if job else []
+        if job:
+            job.findings = self._sorted_findings(job.findings)
+            findings = job.findings
         self._update_category_filter()
         self.findings_table.setRowCount(len(findings))
         for row, finding in enumerate(findings):
@@ -549,6 +572,17 @@ class MainWindow(QMainWindow):
             active.setFlags(active.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             active.setCheckState(Qt.CheckState.Checked if finding.enabled else Qt.CheckState.Unchecked)
             self.findings_table.setItem(row, 0, active)
+
+            correct = QTableWidgetItem()
+            correct.setFlags(correct.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            correct.setCheckState(Qt.CheckState.Checked if finding.correct else Qt.CheckState.Unchecked)
+            self.findings_table.setItem(row, 1, correct)
+
+            incorrect = QTableWidgetItem()
+            incorrect.setFlags(incorrect.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            incorrect.setCheckState(Qt.CheckState.Checked if finding.incorrect else Qt.CheckState.Unchecked)
+            self.findings_table.setItem(row, 2, incorrect)
+
             values = [
                 finding.original_text,
                 finding.replacement_text,
@@ -558,9 +592,9 @@ class MainWindow(QMainWindow):
                 f"{finding.confidence:.2f}",
                 str(finding.occurrence_count),
             ]
-            for col, value in enumerate(values, start=1):
+            for col, value in enumerate(values, start=3):
                 item = QTableWidgetItem(value)
-                if col in (1, 2, 3, 4):
+                if col in (3, 4, 5, 6):
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
                 else:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -649,24 +683,59 @@ class MainWindow(QMainWindow):
         col = item.column()
         if col == 0:
             finding.enabled = item.checkState() == Qt.CheckState.Checked
+            if finding.enabled:
+                finding.incorrect = False
         elif col == 1:
-            finding.original_text = item.text()
+            finding.correct = item.checkState() == Qt.CheckState.Checked
+            if finding.correct:
+                finding.incorrect = False
         elif col == 2:
-            finding.replacement_text = item.text()
+            finding.incorrect = item.checkState() == Qt.CheckState.Checked
+            if finding.incorrect:
+                finding.correct = False
+                finding.enabled = False
         elif col == 3:
-            finding.category = item.text() or "custom"
+            finding.original_text = item.text()
         elif col == 4:
+            finding.replacement_text = item.text()
+        elif col == 5:
+            finding.category = item.text() or "custom"
+        elif col == 6:
             finding.sub_category = item.text() or None
         self._refresh_summary()
-        self._apply_finding_filter()
+        if col in (0, 1, 2):
+            self._refresh_findings()
+        else:
+            self._apply_finding_filter()
 
     def _set_all_findings(self, enabled: bool) -> None:
         if not self.current_job:
             return
         for finding in self.current_job.findings:
             if self._finding_matches_current_filter(finding):
-                finding.enabled = enabled
+                finding.enabled = enabled and not finding.incorrect
         self._refresh_findings()
+
+    def _set_all_review_state(self, field: str, checked: bool) -> None:
+        if not self.current_job:
+            return
+        for finding in self.current_job.findings:
+            if not self._finding_matches_current_filter(finding):
+                continue
+            if field == "correct":
+                finding.correct = checked
+                if checked:
+                    finding.incorrect = False
+            elif field == "incorrect":
+                finding.incorrect = checked
+                if checked:
+                    finding.correct = False
+                    finding.enabled = False
+        self._refresh_findings()
+
+    @staticmethod
+    def _sorted_findings(findings: list[Finding]) -> list[Finding]:
+        return sorted(findings, key=lambda finding: (finding.incorrect, finding.original_text.casefold()))
 
     def _update_category_filter(self) -> None:
         current = self.category_filter.currentData() if hasattr(self, "category_filter") else None

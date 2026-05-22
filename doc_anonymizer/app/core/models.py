@@ -36,11 +36,18 @@ class Finding:
     source: str = "manual"
     locations: list[FindingLocation] = field(default_factory=list)
     enabled: bool = True
+    correct: bool = False
+    incorrect: bool = False
     id: str = field(default_factory=lambda: str(uuid4()))
 
     @property
     def occurrence_count(self) -> int:
         return max(1, len(self.locations))
+
+    def __post_init__(self) -> None:
+        if self.incorrect:
+            self.correct = False
+            self.enabled = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Finding":

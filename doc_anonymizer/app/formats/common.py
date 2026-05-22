@@ -31,6 +31,7 @@ IMAGE_CONTAINER_LOCAL_NAMES = {
     "pic",
     "object",
     "shape",
+    "sp",
 }
 TEXT_XML_DIRS = (
     "word/",
@@ -38,6 +39,13 @@ TEXT_XML_DIRS = (
     "xl/",
     "ppt/",
 )
+VISIBLE_ATTRIBUTE_LOCAL_NAMES = {
+    "descr",
+    "name",
+    "title",
+    "tooltip",
+}
+GUID_VALUE_RE = re.compile(r"^\{?[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}?$")
 
 
 def replace_text(text: str, findings: list[Finding]) -> str:
@@ -78,6 +86,8 @@ def replace_in_openxml_text_nodes(package_path: Path, findings: list[Finding]) -
                                 node.tail = new_tail
                                 changed = True
                         for attr, value in list(node.attrib.items()):
+                            if not _should_replace_openxml_attribute(attr, value, node):
+                                continue
                             new_value = replace_text(value, findings)
                             if new_value != value:
                                 node.attrib[attr] = new_value
@@ -158,8 +168,8 @@ def extract_openxml_text(path: Path) -> list[tuple[str, str]]:
             for node in root.iter():
                 if node.text and node.text.strip():
                     parts.append(node.text)
-                for value in node.attrib.values():
-                    if value and value.strip():
+                for attr, value in node.attrib.items():
+                    if _should_replace_openxml_attribute(attr, value, node) and value and value.strip():
                         parts.append(value)
             if parts:
                 chunks.append(("\n".join(parts), name))
@@ -209,6 +219,20 @@ def placeholder_for_image(original: bytes, suffix: str) -> tuple[bytes, int | No
 
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if tag.startswith("{") else tag
+
+
+def _should_replace_openxml_attribute(attr: str, value: str, node: etree._Element | None = None) -> bool:
+    if GUID_VALUE_RE.match(value.strip()):
+        return False
+    attr_name = _local_name(attr)
+    if attr_name not in VISIBLE_ATTRIBUTE_LOCAL_NAMES:
+        return False
+    if node is None:
+        return True
+    node_name = _local_name(node.tag)
+    if attr_name == "name":
+        return node_name in {"author", "cNvPr", "section"}
+    return True
 
 
 def _is_media_part(name: str) -> bool:
@@ -524,4 +548,56 @@ def neutralize_openxml_media(source: Path, target: Path, job) -> dict[str, Path]
             zout.writestr(item, data)
     tmp_target.unlink(missing_ok=True)
     job.openxml_part_files = openxml_part_files
+    return image_files
+
+
+def replace_openxml_media_with_placeholders(source: Path, target: Path, job) -> dict[str, Path]:
+    """Replace media payloads in-place while preserving OpenXML relationships.
+
+    PowerPoint is stricter than the OpenXML SDK about removing picture markup,
+    especially for extension image types such as HDPhoto. Keeping the package
+    graph intact avoids repair prompts while still removing the original image
+    bytes from the anonymized copy.
+    """
+    image_files: dict[str, Path] = {}
+    keep_by_path = {
+        location.extra.get("package_path"): image.keep
+        for image in getattr(job, "image_replacements", [])
+        for location in image.locations
+        if location.extra.get("package_path")
+    }
+    job.image_replacements = []
+    temp_dir = Path(tempfile.mkdtemp(prefix="docanonymous-media-"))
+    tmp_target = target.with_suffix(target.suffix + ".tmp")
+    shutil.copyfile(target, tmp_target)
+
+    with zipfile.ZipFile(tmp_target, "r") as zin, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            normalized = item.filename.replace("\\", "/")
+            suffix = Path(item.filename).suffix.lower()
+            if _is_media_part(normalized):
+                image_id = f"IMG-{len(job.image_replacements) + 1:06d}"
+                width, height = _image_dimensions(data, suffix)
+                keep_image = keep_by_path.get(normalized, False)
+                job.image_replacements.append(
+                    ImageReplacement(
+                        id=image_id,
+                        original_file_name=Path(item.filename).name,
+                        original_mime_type=_content_type_for_suffix(suffix),
+                        placeholder_text=image_id,
+                        width=width,
+                        height=height,
+                        locations=[ImageLocation(part=item.filename, extra={"package_path": item.filename})],
+                        keep=keep_image,
+                    )
+                )
+                if not keep_image:
+                    original_path = temp_dir / f"{image_id}{suffix}"
+                    original_path.write_bytes(data)
+                    image_files[image_id] = original_path
+                    data, _, _ = placeholder_for_image(data, suffix)
+            zout.writestr(item, data)
+    tmp_target.unlink(missing_ok=True)
+    job.openxml_part_files = {}
     return image_files

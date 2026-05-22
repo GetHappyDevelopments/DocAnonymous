@@ -121,6 +121,23 @@ def test_multiline_address_block_detection(tmp_path: Path) -> None:
     )
 
 
+def test_scan_does_not_merge_person_name_across_control_character(tmp_path: Path) -> None:
+    source = tmp_path / "control.txt"
+    source.write_text("Stefan Jobst\x0bLeiter", encoding="utf-8")
+    job = DocumentJob(source)
+
+    DocumentScanner().scan(job)
+    originals = {finding.original_text for finding in job.findings}
+
+    assert "Stefan Jobst" in originals
+    assert "Stefan Jobst Leiter" not in originals
+    assert not any("Leiter" in original for original in originals)
+    assert all(
+        not any(ord(char) < 32 and char not in "\r\n\t" for char in finding.original_text)
+        for finding in job.findings
+    )
+
+
 def test_manual_findings_are_reused_as_local_learning(tmp_path: Path) -> None:
     source = tmp_path / "learned.txt"
     source.write_text("Codexia Projektbüro liefert. Codexia Projektbüro rechnet ab.", encoding="utf-8")
@@ -151,6 +168,8 @@ def test_project_state_roundtrip(tmp_path: Path) -> None:
     source.write_text("Bayer AG", encoding="utf-8")
     job = DocumentJob(source)
     DocumentScanner().scan(job)
+    job.findings[0].correct = True
+    job.findings[0].incorrect = False
     project = tmp_path / "state.docanon"
 
     store = ProjectStateStore()
@@ -159,6 +178,61 @@ def test_project_state_roundtrip(tmp_path: Path) -> None:
 
     assert loaded[0].source_path == source
     assert loaded[0].findings[0].replacement_text == "Firma AG 1"
+    assert loaded[0].findings[0].correct is True
+    assert loaded[0].findings[0].incorrect is False
+
+
+def test_project_state_load_disables_incorrect_findings(tmp_path: Path) -> None:
+    source = tmp_path / "sample.txt"
+    source.write_text("Bayer AG", encoding="utf-8")
+    project = tmp_path / "state.docanon"
+    project.write_text(
+        """{
+  "schemaVersion": "1.0",
+  "jobs": [
+    {
+      "source_path": "%s",
+      "status": "Scan abgeschlossen",
+      "findings": [
+        {
+          "original_text": "Bayer AG",
+          "replacement_text": "Firma AG 1",
+          "category": "company",
+          "enabled": true,
+          "correct": true,
+          "incorrect": true
+        }
+      ]
+    }
+  ]
+}"""
+        % str(source).replace("\\", "\\\\"),
+        encoding="utf-8",
+    )
+
+    loaded = ProjectStateStore().load(project)
+
+    assert loaded[0].findings[0].incorrect is True
+    assert loaded[0].findings[0].correct is False
+    assert loaded[0].findings[0].enabled is False
+
+
+def test_rescan_preserves_incorrect_findings_as_inactive_at_end(tmp_path: Path) -> None:
+    source = tmp_path / "sample.txt"
+    source.write_text("Bayer AG test@example.com", encoding="utf-8")
+    job = DocumentJob(source)
+    scanner = DocumentScanner()
+    scanner.scan(job)
+
+    bayer = next(finding for finding in job.findings if finding.original_text == "Bayer AG")
+    bayer.incorrect = True
+    bayer.enabled = False
+
+    scanner.scan(job)
+
+    assert job.findings[-1].original_text == "Bayer AG"
+    assert job.findings[-1].incorrect is True
+    assert job.findings[-1].enabled is False
 
 
 def test_txt_restore_roundtrip(tmp_path: Path) -> None:
@@ -460,6 +534,267 @@ def test_pptx_anonymize_preserves_run_formatting(tmp_path: Path) -> None:
     assert 'b="1"' in slide_xml
     assert 'i="1"' in slide_xml
     assert " bleibt sichtbar" in slide_xml
+
+
+def test_pptx_anonymize_replaces_media_payloads_without_removing_relationships(tmp_path: Path) -> None:
+    source = tmp_path / "media.pptx"
+    with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+</Types>""",
+        )
+        zf.writestr(
+            "ppt/slides/slide1.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld><p:spTree><p:pic><p:blipFill><a:blip r:embed="rIdImage"/></p:blipFill></p:pic></p:spTree></p:cSld>
+</p:sld>""",
+        )
+        zf.writestr(
+            "ppt/slides/_rels/slide1.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>""",
+        )
+        zf.writestr("ppt/media/image1.png", b"not-a-real-image")
+
+    job = DocumentJob(source)
+    DocumentAnonymizer().anonymize(job, tmp_path)
+
+    with zipfile.ZipFile(job.output_path, "r") as zf:
+        names = zf.namelist()
+        rels = zf.read("ppt/slides/_rels/slide1.xml.rels")
+        media = zf.read("ppt/media/image1.png")
+
+    assert "ppt/media/image1.png" in names
+    assert b"rIdImage" in rels
+    assert media != b"not-a-real-image"
+    assert media.startswith(b"\x89PNG")
+    assert job.image_replacements[0].original_file_name == "image1.png"
+
+
+def test_pptx_anonymize_removes_shape_image_fill_container(tmp_path: Path) -> None:
+    from doc_anonymizer.app.formats.common import neutralize_openxml_media
+
+    source = tmp_path / "shape-fill.pptx"
+    target = tmp_path / "shape-fill.anonymized.pptx"
+    slide_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld>
+    <p:spTree>
+      <p:sp>
+        <p:nvSpPr><p:cNvPr id="2" name="Picture fill"/></p:nvSpPr>
+        <p:spPr>
+          <a:blipFill>
+            <a:blip r:embed="rIdImage"/>
+            <a:stretch><a:fillRect/></a:stretch>
+          </a:blipFill>
+        </p:spPr>
+      </p:sp>
+      <p:sp>
+        <p:nvSpPr><p:cNvPr id="3" name="Text"/></p:nvSpPr>
+        <p:txBody><a:p><a:r><a:t>Keep me</a:t></a:r></a:p></p:txBody>
+      </p:sp>
+    </p:spTree>
+  </p:cSld>
+</p:sld>"""
+    with zipfile.ZipFile(source, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+</Types>""",
+        )
+        zf.writestr("ppt/slides/slide1.xml", slide_xml)
+        zf.writestr(
+            "ppt/slides/_rels/slide1.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>""",
+        )
+        zf.writestr("ppt/media/image1.png", b"not-a-real-image")
+
+    job = DocumentJob(source)
+    target.write_bytes(source.read_bytes())
+    neutralize_openxml_media(source, target, job)
+
+    with zipfile.ZipFile(target, "r") as zf:
+        anonymized_slide = zf.read("ppt/slides/slide1.xml").decode("utf-8")
+        anonymized_rels = zf.read("ppt/slides/_rels/slide1.xml.rels").decode("utf-8")
+        names = zf.namelist()
+
+    assert "ppt/media/image1.png" not in names
+    assert "rIdImage" not in anonymized_rels
+    assert "Picture fill" not in anonymized_slide
+    assert "<a:blipFill" not in anonymized_slide
+    assert "Keep me" in anonymized_slide
+
+
+def test_pptx_anonymize_does_not_replace_technical_guid_attributes(tmp_path: Path) -> None:
+    from doc_anonymizer.app.formats.common import replace_in_openxml_text_nodes
+
+    package = tmp_path / "technical-id.pptx"
+    slide_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main">
+  <p:cSld>
+    <p:spTree>
+      <p:sp>
+        <p:nvSpPr>
+          <p:cNvPr id="2" name="Visible 4727">
+            <a:extLst>
+              <a:ext uri="{FF2B5EF4-FFF2-40B4-BE49-F238E27FC236}">
+                <a16:creationId id="{56803C33-DFCA-4727-8FAE-79FBA6BBAD89}"/>
+              </a:ext>
+            </a:extLst>
+          </p:cNvPr>
+        </p:nvSpPr>
+        <p:txBody><a:p><a:r><a:t>Visible 4727</a:t></a:r></a:p></p:txBody>
+      </p:sp>
+    </p:spTree>
+  </p:cSld>
+</p:sld>"""
+    with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+</Types>""",
+        )
+        zf.writestr("ppt/slides/slide1.xml", slide_xml)
+
+    replace_in_openxml_text_nodes(
+        package,
+        [
+            Finding(
+                original_text="4727",
+                replacement_text="Telefon 657",
+                category="phone",
+            )
+        ],
+    )
+
+    with zipfile.ZipFile(package, "r") as zf:
+        anonymized_slide = zf.read("ppt/slides/slide1.xml").decode("utf-8")
+
+    assert "Visible Telefon 657" in anonymized_slide
+    assert '{56803C33-DFCA-4727-8FAE-79FBA6BBAD89}' in anonymized_slide
+    assert "{56803C33-DFCA-Telefon 657-8FAE-79FBA6BBAD89}" not in anonymized_slide
+
+
+def test_pptx_scan_and_anonymize_ignore_technical_uri_attributes(tmp_path: Path) -> None:
+    from doc_anonymizer.app.formats.common import extract_openxml_text, replace_in_openxml_text_nodes
+
+    package = tmp_path / "technical-uri.pptx"
+    slide_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:graphicFrame>
+        <a:graphic>
+          <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
+            <a:t>http://example.com/customer</a:t>
+          </a:graphicData>
+        </a:graphic>
+      </p:graphicFrame>
+    </p:spTree>
+  </p:cSld>
+</p:sld>"""
+    with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+</Types>""",
+        )
+        zf.writestr("ppt/slides/slide1.xml", slide_xml)
+
+    extracted = "\n".join(text for text, _part in extract_openxml_text(package))
+    assert "http://example.com/customer" in extracted
+    assert "http://schemas.openxmlformats.org/drawingml/2006/diagram" not in extracted
+
+    replace_in_openxml_text_nodes(
+        package,
+        [
+            Finding(
+                original_text="http://schemas.openxmlformats.org/drawingml/2006/diagram",
+                replacement_text="URL 1",
+                category="url",
+            ),
+            Finding(
+                original_text="http://example.com/customer",
+                replacement_text="URL 2",
+                category="url",
+            ),
+        ],
+    )
+
+    with zipfile.ZipFile(package, "r") as zf:
+        anonymized_slide = zf.read("ppt/slides/slide1.xml").decode("utf-8")
+
+    assert 'uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"' in anonymized_slide
+    assert "URL 2" in anonymized_slide
+    assert 'uri="URL 1"' not in anonymized_slide
+
+
+def test_openxml_property_name_attributes_are_not_replaced(tmp_path: Path) -> None:
+    from doc_anonymizer.app.formats.common import extract_openxml_text, replace_in_openxml_text_nodes
+
+    package = tmp_path / "custom-props.docx"
+    custom_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
+            xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="MediaPersonImageTags">
+    <vt:lpwstr>MediaPersonImageTags</vt:lpwstr>
+  </property>
+</Properties>"""
+    with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+</Types>""",
+        )
+        zf.writestr("docProps/custom.xml", custom_xml)
+
+    extracted = "\n".join(text for text, _part in extract_openxml_text(package))
+    assert "MediaPersonImageTags" in extracted
+
+    replace_in_openxml_text_nodes(
+        package,
+        [
+            Finding(
+                original_text="Person",
+                replacement_text="Person 1",
+                category="person",
+            )
+        ],
+    )
+
+    with zipfile.ZipFile(package, "r") as zf:
+        anonymized_props = zf.read("docProps/custom.xml").decode("utf-8")
+
+    assert 'name="MediaPersonImageTags"' in anonymized_props
+    assert "MediaPerson 1ImageTags" in anonymized_props
 
 
 def test_pdf_scan_and_anonymize_with_pdfium(tmp_path: Path) -> None:

@@ -11,12 +11,20 @@ from doc_anonymizer.app.detection.regex_detector import RegexDetector
 from doc_anonymizer.app.formats import get_handler
 
 
+CONTROL_WHITESPACE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
+
+
 class DocumentScanner:
     def __init__(self, llm_analyzer: LocalLlmAnalyzer | None = None) -> None:
         self.regex_detector = RegexDetector()
         self.llm_analyzer = llm_analyzer or LocalLlmAnalyzer()
 
     def scan(self, job: DocumentJob) -> list[Finding]:
+        review_state = {
+            self._review_key(finding): (finding.correct, finding.incorrect)
+            for finding in job.findings
+            if finding.correct or finding.incorrect
+        }
         handler = get_handler(job.source_path)
         chunks = handler.extract_text(job.source_path)
         raw_findings: list[Finding] = []
@@ -28,9 +36,37 @@ class DocumentScanner:
 
         raw_findings.extend(self._propagate_document_entities(raw_findings, chunks))
 
-        job.findings = self._merge_and_assign_placeholders(raw_findings)
+        raw_findings = [finding for finding in self._clean_findings(raw_findings) if finding.original_text]
+        job.findings = self._apply_review_state(self._merge_and_assign_placeholders(raw_findings), review_state)
         job.status = "Scan abgeschlossen"
         return job.findings
+
+    @staticmethod
+    def _clean_findings(findings: list[Finding]) -> list[Finding]:
+        for finding in findings:
+            finding.original_text = CONTROL_WHITESPACE_RE.sub(" ", finding.original_text)
+            finding.original_text = re.sub(r"[ \t\u00a0]+", " ", finding.original_text).strip(" \t\r\n,;:.")
+        return findings
+
+    @classmethod
+    def _apply_review_state(
+        cls,
+        findings: list[Finding],
+        review_state: dict[tuple[str, str, str], tuple[bool, bool]],
+    ) -> list[Finding]:
+        for finding in findings:
+            correct, incorrect = review_state.get(cls._review_key(finding), (False, False))
+            finding.correct = correct
+            finding.incorrect = incorrect
+            if finding.incorrect:
+                finding.correct = False
+                finding.enabled = False
+        return sorted(findings, key=lambda finding: (finding.incorrect, finding.original_text.casefold()))
+
+    @staticmethod
+    def _review_key(finding: Finding) -> tuple[str, str, str]:
+        original = re.sub(r"\s+", " ", finding.original_text).strip().casefold()
+        return (original, finding.category, finding.sub_category or "")
 
     def _find_learned_entities(self, text: str, part: str, learned_findings: list[Finding]) -> list[Finding]:
         propagated: list[Finding] = []

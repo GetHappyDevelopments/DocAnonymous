@@ -12,7 +12,8 @@ WORD = r"[\wÄÖÜäöüß&+.'-]+"
 NAME_WORD = r"[A-ZÄÖÜ][a-zäöüß]+(?:[-'][A-ZÄÖÜ]?[a-zäöüß]+)?"
 COMPANY_WORD = r"[A-ZÄÖÜ0-9][\wÄÖÜäöüß&+.'-]*"
 COMPANY_TOKEN = rf"(?:{COMPANY_WORD}|&)"
-HSPACE = r"[^\S\r\n]"
+HSPACE = r"[ \t\u00a0]"
+CONTROL_WHITESPACE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 PLZ_CITY = rf"\d{{5}}{HSPACE}+[A-ZÄÖÜ][\wÄÖÜäöüß.'-]+(?:{HSPACE}+[A-ZÄÖÜ][\wÄÖÜäöüß.'-]+){{0,2}}"
 
 
@@ -372,7 +373,8 @@ class RegexDetector:
 
     @staticmethod
     def _clean_value(value: str) -> str:
-        return re.sub(r"[ \t]+", " ", value).strip(" \t\r\n,;:.")
+        value = CONTROL_WHITESPACE_RE.sub(" ", value)
+        return re.sub(r"[ \t\u00a0]+", " ", value).strip(" \t\r\n,;:.")
 
     @staticmethod
     def _trim_company_prefix(value: str, start: int, end: int) -> tuple[str, int, int]:
